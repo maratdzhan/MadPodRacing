@@ -8,32 +8,18 @@ using namespace std;
 
 // Physics
 constexpr double FRICTION = 0.85;
-constexpr double MAX_TURN_DEG = 18.0;
+constexpr double MAX_TURN = 18.0 * M_PI / 180.0;
 constexpr double CP_RADIUS = 590.0;
 constexpr double CP_RADIUS_REDUCTION = 10.0;
 constexpr double COLLISION_RADIUS = 800.0;
 constexpr double MIN_COLLISION_IMPULSE = 120.0;
+constexpr double DEG_TO_RAD = M_PI / 180.0;
 
 // Simulation
-constexpr int SIM_DEPTH = 7;
-constexpr int TOTAL_LAPS = 3;
+constexpr int SIM_DEPTH = 4;
 constexpr int ZERO_THRUST_MAX_FRAMES = 7;
 constexpr int ZERO_THRUST_OVERRIDE = 20;
 constexpr double TARGET_POINT_DIST = 10000.0;
-
-// Search: step 0
-constexpr double ANGLE_OFFSETS_1[] = {-50, -36, -24, -18, -12, -6, 0, 6, 12, 18, 24, 36, 50, 180};
-constexpr int THRUST_OPTIONS_1[] = {10, 35, 55, 75, 100, 0};
-constexpr int THRUST_OPTIONS_1_BOOST[] = {10, 35, 55, 75, 100, 0, 650};
-constexpr int ANGLE_COUNT_1 = sizeof(ANGLE_OFFSETS_1) / sizeof(ANGLE_OFFSETS_1[0]);
-constexpr int THRUST_COUNT_1 = sizeof(THRUST_OPTIONS_1) / sizeof(THRUST_OPTIONS_1[0]);
-constexpr int THRUST_COUNT_1_BOOST = sizeof(THRUST_OPTIONS_1_BOOST) / sizeof(THRUST_OPTIONS_1_BOOST[0]);
-
-// Search: steps 1-2
-constexpr double ANGLE_OFFSETS_23[] = {-24, -12, 0, 12, 24, 180};
-constexpr int THRUST_OPTIONS_23[] = {0, 10, 45, 75};
-constexpr int ANGLE_COUNT_23 = sizeof(ANGLE_OFFSETS_23) / sizeof(ANGLE_OFFSETS_23[0]);
-constexpr int THRUST_COUNT_23 = sizeof(THRUST_OPTIONS_23) / sizeof(THRUST_OPTIONS_23[0]);
 
 // Scoring
 constexpr double SCORE_CP_PASSED = 50000.0;
@@ -41,10 +27,11 @@ constexpr double SCORE_EARLY_ARRIVAL = 5000.0;
 constexpr double SCORE_SPEED_WEIGHT_FINAL = 0.025;
 constexpr double SCORE_SPEED_TOWARD_NORMAL = 3.0;
 constexpr double SCORE_SPEED_TOWARD_FINAL = 10.0;
-constexpr double SCORE_DIST_TO_NEXT_WEIGHT = 1.0;
+constexpr double SCORE_DIST_TO_NEXT_WEIGHT = 2.0;
 
 // Boost
-constexpr int BOOST_MIN_DIST = 4000;
+constexpr int BOOST_MIN_DIST = 5500;
+constexpr int BOOST_MIN_LAP = 2;
 constexpr double BOOST_SCORE_THRESHOLD = 10000.0;
 
 // Shield
@@ -55,12 +42,50 @@ constexpr double NORMAL_MASS = 1.0;
 constexpr double SHIELD_CHECK_DIST = 1200.0;
 constexpr double SHIELD_SCORE_THRESHOLD = 0.0;
 constexpr double SHIELD_COLLISION_BONUS = 18000.0;
+constexpr double SHIELD_COLLISION_BONUS_BLOCKER = 35000.0;
 constexpr double SHIELD_MIN_REL_SPEED_SQ = 125000.0;
+constexpr double BOOST_COLLISION_BONUS_BLOCKER = 12500.0;
+constexpr double TEAMMATE_COLLISION_PENALTY = 20000.0;
 
-// Track detection
-constexpr double CLOSE_DIST_THRESHOLD = 750.0;
-constexpr double MAP_CENTER_X = 8000.0;
-constexpr double MAP_CENTER_Y = 4500.0;
+// Search: step 0
+constexpr double ANGLE_OFFSETS_1[] = {
+    -50*DEG_TO_RAD, -24*DEG_TO_RAD, -18*DEG_TO_RAD, -12*DEG_TO_RAD, -6*DEG_TO_RAD, 0,
+    6*DEG_TO_RAD, 12*DEG_TO_RAD, 18*DEG_TO_RAD, 24*DEG_TO_RAD, 50*DEG_TO_RAD, M_PI
+};
+constexpr int THRUST_OPTIONS_1[] = {10, 35, 55, 75, 100, 0};
+constexpr int ANGLE_COUNT_1 = sizeof(ANGLE_OFFSETS_1) / sizeof(ANGLE_OFFSETS_1[0]);
+constexpr int THRUST_COUNT_1 = sizeof(THRUST_OPTIONS_1) / sizeof(THRUST_OPTIONS_1[0]);
+
+// Search: steps 1-2
+constexpr double ANGLE_OFFSETS_23[] = {
+    -24*DEG_TO_RAD, -12*DEG_TO_RAD, 0, 12*DEG_TO_RAD, 24*DEG_TO_RAD, M_PI
+};
+constexpr int THRUST_OPTIONS_23[] = {0, 10, 45, 75};
+constexpr int ANGLE_COUNT_23 = sizeof(ANGLE_OFFSETS_23) / sizeof(ANGLE_OFFSETS_23[0]);
+constexpr int THRUST_COUNT_23 = sizeof(THRUST_OPTIONS_23) / sizeof(THRUST_OPTIONS_23[0]);
+
+// ===== Global game state =====
+
+int totalLaps;
+int checkpointCount;
+
+struct Point {
+    int x, y;
+    Point(int x=0, int y=0) : x(x), y(y) {}
+    bool operator==(const Point& p) const { return x == p.x && y == p.y; }
+    bool operator!=(const Point& p) const { return !(*this == p); }
+    Point operator+(const Point& p) const { return Point(x + p.x, y + p.y); }
+    bool operator<(const Point& p) const {
+        if (x != p.x) return x < p.x;
+        return y < p.y;
+    }
+    friend ostream& operator<<(ostream& os, const Point& p) {
+        os << "{" << p.x << ";" << p.y << "}";
+        return os;
+    }
+};
+
+Point checkpoints[20];
 
 template<typename K>
 ostream& operator<<(ostream& os, const vector<K>& v) {
@@ -71,31 +96,12 @@ ostream& operator<<(ostream& os, const vector<K>& v) {
     return os;
 }
 
-struct Point {
-    int x, y;
-    Point(int x=0, int y=0) : x(x), y(y) {}
-
-    bool operator==(const Point& p) const { return x == p.x && y == p.y; }
-    bool operator!=(const Point& p) const { return !(*this == p); }
-    Point operator+(const Point& p) const { return Point(x + p.x, y + p.y); }
-    bool operator<(const Point& p) const {
-        if (x != p.x) return x < p.x;
-        return y < p.y;
-    }
-
-    friend ostream& operator<<(ostream& os, const Point& p) {
-        os << "{" << p.x << ";" << p.y << "}";
-        return os;
-    }
-};
-
 double normalizeAngle(double angle) {
-    while (angle > 180) angle -= 360;
-    while (angle < -180) angle += 360;
+    while (angle > M_PI) angle -= 2 * M_PI;
+    while (angle < -M_PI) angle += 2 * M_PI;
     return angle;
 }
 
-// Check if line segment (x1,y1)→(x2,y2) passes within radius of (px,py)
 bool segmentIntersectsCircle(double x1, double y1, double x2, double y2,
                               double px, double py, double radius) {
     double dx = x2 - x1, dy = y2 - y1;
@@ -113,10 +119,12 @@ bool segmentIntersectsCircle(double x1, double y1, double x2, double y2,
 }
 
 struct SimState {
-    double x, y, vx, vy, facingAngle; // facingAngle in degrees
+    double x, y, vx, vy, facingAngle; // facingAngle in radians
     int cpsPassed;
     int shieldTurnsLeft;
     bool shieldCollided;
+    bool boostCollided;
+    bool teammateCollided;
 
     double distTo(double px, double py) const {
         double dx = px - x, dy = py - y;
@@ -124,198 +132,153 @@ struct SimState {
     }
 
     double angleTo(double px, double py) const {
-        return atan2(py - y, px - x) * 180.0 / M_PI;
+        return atan2(py - y, px - x);
     }
 };
 
 struct Pod {
+    Pod() : shieldCooldown(0), zeroThrustFrames(0), boostAvailable(true),
+            currentLap(1), totalCpsPassed(0), prevNextCpId(-1) {}
 
-    Pod() : vx(0), vy(0), opVx(0), opVy(0), opFirstFrame(true),
-            facingAngleDeg(0), firstFrame(true), shieldCooldown(0),
-            zeroThrustFrames(0), trackComplete(false), boostAvailable(true),
-            currentLap(1), prevCpIndex(-1) {}
+    // Current state (from input)
+    double x, y, vx, vy;
+    double facingAngle; // radians
+    int nextCpId;
 
-
-    // Track original game checkpoints (without midpoints)
-    vector<Point> gameCheckpoints;
-    bool trackComplete;
+    // Persistent state
+    int shieldCooldown;
+    int zeroThrustFrames;
     bool boostAvailable;
     int currentLap;
-    int prevCpIndex;
+    int totalCpsPassed;
+    int prevNextCpId;
 
-    // Call once on first frame with pod's starting position
-    void initStartPosition(int x, int y) {
-        gameCheckpoints.push_back(Point(x, y));
-    }
+    // Role
+    bool isBlocker = false;
+    double leadEnemyX, leadEnemyY;
 
-    bool isCloseTo(const Point& a, const Point& b) const {
-        double dx = a.x - b.x;
-        double dy = a.y - b.y;
-        return dx*dx + dy*dy < CLOSE_DIST_THRESHOLD * CLOSE_DIST_THRESHOLD;
-    }
+    // Output
+    Point targetPosition;
+    int thrust;
 
-    void trackCheckpoint(const Point& cp) {
-        if (!trackComplete) {
-            // Check if this CP is close to start position (loop detected)
-            if (gameCheckpoints.size() > 1 && isCloseTo(cp, gameCheckpoints[0])) {
-                cerr << "Start pos replaced: " << gameCheckpoints[0] << " -> " << cp << endl;
-                gameCheckpoints[0] = cp; // overwrite start pos with exact CP coords
-                trackComplete = true;
-                cerr << "Track complete: " << gameCheckpoints << endl;
-            } else if (cp != gameCheckpoints.back()) {
-                gameCheckpoints.push_back(cp);
-            }
+    // Other pods for collision prediction
+    static constexpr int MAX_OTHERS = 3;
+    struct OtherPodState {
+        double x, y, vx, vy;
+    };
+    OtherPodState others[MAX_OTHERS];
+    int otherCount;
+
+    struct PodPrediction {
+        double x, y, vx, vy;
+    };
+    PodPrediction otherPredictions[MAX_OTHERS][SIM_DEPTH + 1];
+
+    void setState(int px, int py, int pvx, int pvy, int angleDeg, int cpId) {
+        x = px; y = py;
+        vx = pvx; vy = pvy;
+        facingAngle = angleDeg * DEG_TO_RAD;
+        nextCpId = cpId;
+        targetPosition = checkpoints[cpId];
+
+        if (prevNextCpId >= 0 && cpId != prevNextCpId) {
+            totalCpsPassed++;
+            currentLap = 1 + totalCpsPassed / checkpointCount;
         }
-        if (trackComplete) {
-            int cpIdx = getCpIndex(cp);
-            if (cpIdx >= 0 && cpIdx != prevCpIndex) {
-                if (cpIdx == 0 && prevCpIndex > 0) {
-                    currentLap++;
-                    cerr << "Lap " << currentLap << endl;
-                }
-                prevCpIndex = cpIdx;
-            }
-        }
+        prevNextCpId = cpId;
     }
 
-    int getCpIndex(const Point& cp) const {
-        for (int i = 0; i < (int)gameCheckpoints.size(); i++) {
-            if (gameCheckpoints[i] == cp) return i;
-        }
-        return -1;
-    }
-
-    Point getNextCheckpoint(const Point& currentCp) const {
-        if (!trackComplete) return Point((int)MAP_CENTER_X, (int)MAP_CENTER_Y);
-        int idx = getCpIndex(currentCp);
-        if (idx >= 0) return gameCheckpoints[(idx + 1) % gameCheckpoints.size()];
-        return currentCp;
+    void setOthers(const OtherPodState* o, int count) {
+        otherCount = count;
+        for (int i = 0; i < count; i++) others[i] = o[i];
     }
 
     bool isFinalLap() const {
-        return currentLap >= TOTAL_LAPS;
+        return currentLap >= totalLaps;
     }
 
-    void setPos(int x, int y) {
-        position.x = x;
-        position.y = y;
+    Point getNextCp() const {
+        return checkpoints[nextCpId];
     }
 
-    void setDistance(int dist) {
-        next_checkpoint_dist = dist;
+    Point getAfterNextCp() const {
+        return checkpoints[(nextCpId + 1) % checkpointCount];
     }
 
-    void setNextCheckpointAngle(int a) {
-        next_checkpoint_angle = a;
-    }
+    // Teammate's chosen move (set externally before findBestMove for pod[1])
+    bool hasTeammateMove = false;
+    double teammateAngle; // radians
+    int teammateThrust;
+    double teammateFacing; // radians
 
-    void setTargetPosition(const Point& t) {
-        targetPosition = t;
-    }
+    void precomputeOthers() {
+        for (int p = 0; p < otherCount; p++) {
+            double ox = others[p].x, oy = others[p].y;
+            double ovx = others[p].vx, ovy = others[p].vy;
+            otherPredictions[p][0] = {ox, oy, ovx, ovy};
 
-    void trackVelocity(int newX, int newY, double& outVx, double& outVy,
-                        Point& prevPos, bool& isFirstFrame) {
-        if (!isFirstFrame) {
-            outVx = newX - prevPos.x;
-            outVy = newY - prevPos.y;
-        }
-        prevPos = Point(newX, newY);
-        isFirstFrame = false;
-    }
-
-    void computeVelocity(int newX, int newY) {
-        trackVelocity(newX, newY, vx, vy, prevPosition, firstFrame);
-    }
-
-    void computeOpponent(int ox, int oy) {
-        trackVelocity(ox, oy, opVx, opVy, prevOpponentPos, opFirstFrame);
-        opponentPos = prevOpponentPos;
-    }
-
-    // Derive absolute facing angle from game's relative angle
-    void computeFacingAngle(int cpX, int cpY) {
-        double dirToCp = atan2(cpY - position.y, cpX - position.x) * 180.0 / M_PI;
-        facingAngleDeg = dirToCp - next_checkpoint_angle;
-    }
-
-    // Precomputed opponent predictions for each step
-    struct OpponentPrediction {
-        double x, y, vx, vy;
-    };
-    OpponentPrediction opPredictions[SIM_DEPTH + 1];
-
-    void precomputeOpponent() {
-        double ox = opponentPos.x, oy = opponentPos.y;
-        double ovx = opVx, ovy = opVy;
-        opPredictions[0] = {ox, oy, ovx, ovy};
-        for (int i = 1; i <= SIM_DEPTH; i++) {
-            ox += ovx;
-            oy += ovy;
-            ovx = (int)(ovx * FRICTION);
-            ovy = (int)(ovy * FRICTION);
-            opPredictions[i] = {ox, oy, ovx, ovy};
+            // For teammate (p==0): use real move for step 1
+            if (p == 0 && hasTeammateMove) {
+                SimState ts = {ox, oy, ovx, ovy, teammateFacing, 0, 0, false};
+                ts = simStep(ts, teammateAngle, teammateThrust);
+                ox = ts.x; oy = ts.y;
+                ovx = ts.vx; ovy = ts.vy;
+                otherPredictions[p][1] = {ox, oy, ovx, ovy};
+                for (int i = 2; i <= SIM_DEPTH; i++) {
+                    ox += ovx; oy += ovy;
+                    ovx = (int)(ovx * FRICTION);
+                    ovy = (int)(ovy * FRICTION);
+                    otherPredictions[p][i] = {ox, oy, ovx, ovy};
+                }
+            } else {
+                for (int i = 1; i <= SIM_DEPTH; i++) {
+                    ox += ovx; oy += ovy;
+                    ovx = (int)(ovx * FRICTION);
+                    ovy = (int)(ovy * FRICTION);
+                    otherPredictions[p][i] = {ox, oy, ovx, ovy};
+                }
+            }
         }
     }
 
-    // Apply elastic collision between simPod and opponent
     bool applyCollision(SimState& s, double ox, double oy, double ovx, double ovy, double myMass = NORMAL_MASS) {
         double dx = s.x - ox;
         double dy = s.y - oy;
         double distSq = dx*dx + dy*dy;
         if (distSq >= COLLISION_RADIUS * COLLISION_RADIUS || distSq < 1e-9) return false;
         double dist = sqrt(distSq);
-
         double nx = dx / dist;
         double ny = dy / dist;
-
         double dvx = s.vx - ovx;
         double dvy = s.vy - ovy;
         double dvn = dvx * nx + dvy * ny;
-
         if (dvn > 0) return false;
-
-        // Impulse with mass: opponent mass is always 1
         double totalMass = myMass + NORMAL_MASS;
         double impulse = max(MIN_COLLISION_IMPULSE, -2.0 * NORMAL_MASS * dvn / totalMass);
-
         s.vx += impulse * nx;
         s.vy += impulse * ny;
-
         double overlap = COLLISION_RADIUS - dist;
         s.x += overlap * nx * 0.5;
         s.y += overlap * ny * 0.5;
         return true;
     }
 
-    // Simulate one frame of game physics
     SimState simStep(SimState s, double targetAngle, int simThrust) {
-        // 1. Rotation: max 18 deg per frame
         double diff = normalizeAngle(targetAngle - s.facingAngle);
-        if (diff > MAX_TURN_DEG) diff = MAX_TURN_DEG;
-        if (diff < -MAX_TURN_DEG) diff = -MAX_TURN_DEG;
+        if (diff > MAX_TURN) diff = MAX_TURN;
+        if (diff < -MAX_TURN) diff = -MAX_TURN;
         s.facingAngle += diff;
-
-        // 2. Thrust applied in facing direction
-        double rad = s.facingAngle * M_PI / 180.0;
-        s.vx += simThrust * cos(rad);
-        s.vy += simThrust * sin(rad);
-
-        // 3. Movement
+        s.vx += simThrust * cos(s.facingAngle);
+        s.vy += simThrust * sin(s.facingAngle);
         s.x += s.vx;
         s.y += s.vy;
-
-        // 4. Friction (truncate to int, as the game does)
         s.vx = (int)(s.vx * FRICTION);
         s.vy = (int)(s.vy * FRICTION);
-
-        // 5. Truncate position
         s.x = (int)s.x;
         s.y = (int)s.y;
-
         return s;
     }
 
-    // Resolve thrust considering shield state
     int resolveThrust(int simThrust, SimState& s) const {
         if (simThrust == SHIELD_THRUST_VALUE) {
             s.shieldTurnsLeft = SHIELD_COOLDOWN;
@@ -328,65 +291,84 @@ struct Pod {
         return simThrust;
     }
 
-    // Get mass for collision (shield active = heavy)
     double getMass(int originalThrust) const {
         return (originalThrust == SHIELD_THRUST_VALUE) ? SHIELD_MASS : NORMAL_MASS;
     }
 
-    // Simulate one candidate step: apply move, collision, checkpoint detection
+    bool anyOtherNear(const SimState& s, int step) const {
+        for (int p = 0; p < otherCount; p++) {
+            const auto& op = otherPredictions[p][step];
+            double dx = s.x - op.x, dy = s.y - op.y;
+            if (dx*dx + dy*dy < COLLISION_RADIUS * COLLISION_RADIUS) return true;
+        }
+        return false;
+    }
+
     SimState simCandidate(SimState s, double aimAngle, int simThrust, int step,
-                          Point& simTarget, int& arrivalFrame,
+                          int& simNextCpId, int& arrivalFrame,
                           const Point& currentCp, const Point& nextCp) {
         double myMass = getMass(simThrust);
         int actualThrust = resolveThrust(simThrust, s);
-
         double prevX = s.x, prevY = s.y;
         s = simStep(s, aimAngle, actualThrust);
-        const auto& op = opPredictions[step+1];
-        bool collided = applyCollision(s, op.x, op.y, op.vx, op.vy, myMass);
-        if (collided && myMass > NORMAL_MASS) s.shieldCollided = true;
-        double opDistSq = (s.x - op.x)*(s.x - op.x) + (s.y - op.y)*(s.y - op.y);
-        double cpRadius = (opDistSq < COLLISION_RADIUS * COLLISION_RADIUS) ? CP_RADIUS - CP_RADIUS_REDUCTION : CP_RADIUS;
+
+        for (int p = 0; p < otherCount; p++) {
+            const auto& op = otherPredictions[p][step+1];
+            bool hit = applyCollision(s, op.x, op.y, op.vx, op.vy, myMass);
+            if (hit) {
+                if (p == 0) {
+                    s.teammateCollided = true;
+                } else {
+                    if (myMass > NORMAL_MASS) s.shieldCollided = true;
+                    if (simThrust == 650) s.boostCollided = true;
+                }
+            }
+        }
+
+        double cpRadius = anyOtherNear(s, step+1) ? CP_RADIUS - CP_RADIUS_REDUCTION : CP_RADIUS;
+
+        Point simTarget = checkpoints[simNextCpId];
         if (segmentIntersectsCircle(prevX, prevY, s.x, s.y,
                                      simTarget.x, simTarget.y, cpRadius)) {
             s.cpsPassed++;
             if (arrivalFrame < 0) arrivalFrame = step + 1;
-            if (simTarget == currentCp) simTarget = nextCp;
+            simNextCpId = (simNextCpId + 1) % checkpointCount;
         }
         return s;
     }
 
     int angleDependentThrust(double aimAngle, double facingAngle) const {
-        return max(20, (int)(100 - abs(normalizeAngle(aimAngle - facingAngle))));
+        return max(20, (int)(100 - abs(normalizeAngle(aimAngle - facingAngle)) / DEG_TO_RAD));
     }
 
-    // Run heuristic rollout for remaining steps
-    SimState rollout(SimState s, int fromStep, Point& simTarget, int& arrivalFrame,
+    SimState rollout(SimState s, int fromStep, int& simNextCpId, int& arrivalFrame,
                      const Point& currentCp, const Point& nextCp) {
         for (int step = fromStep; step < SIM_DEPTH; step++) {
-            double aimAngle = s.angleTo(simTarget.x, simTarget.y);
-            // Shield cooldown handled inside simCandidate via resolveThrust
+            Point target = checkpoints[simNextCpId];
+            double aimAngle = s.angleTo(target.x, target.y);
             int rollThrust = angleDependentThrust(aimAngle, s.facingAngle);
-            s = simCandidate(s, aimAngle, rollThrust, step, simTarget, arrivalFrame, currentCp, nextCp);
+            s = simCandidate(s, aimAngle, rollThrust, step, simNextCpId, arrivalFrame, currentCp, nextCp);
         }
         return s;
     }
 
-    // Evaluate score for a completed simulation
     double evaluateScore(const SimState& simPod, int arrivalFrame,
                          const Point& currentCp, const Point& nextCp) {
-        double bonus = simPod.shieldCollided ? SHIELD_COLLISION_BONUS : 0.0;
+        double bonus = 0.0;
+        if (simPod.shieldCollided) {
+            bonus = isBlocker ? SHIELD_COLLISION_BONUS_BLOCKER : SHIELD_COLLISION_BONUS;
+        } else if (simPod.boostCollided && isBlocker) {
+            bonus = BOOST_COLLISION_BONUS_BLOCKER;
+        }
+        if (simPod.teammateCollided) {
+            bonus -= TEAMMATE_COLLISION_PENALTY;
+        }
 
         if (simPod.cpsPassed > 0) {
             double score = simPod.cpsPassed * SCORE_CP_PASSED
                          + (SIM_DEPTH - arrivalFrame) * SCORE_EARLY_ARRIVAL + bonus;
-            if (isFinalLap() || nextCp == currentCp) {
-                double speedSq = simPod.vx * simPod.vx + simPod.vy * simPod.vy;
-                score += speedSq * SCORE_SPEED_WEIGHT_FINAL;
-            } else {
-                double distToNext = simPod.distTo(nextCp.x, nextCp.y);
-                score -= distToNext * SCORE_DIST_TO_NEXT_WEIGHT;
-            }
+            double distToNext = simPod.distTo(nextCp.x, nextCp.y);
+            score -= distToNext * SCORE_DIST_TO_NEXT_WEIGHT;
             return score;
         }
         double dist = simPod.distTo(currentCp.x, currentCp.y);
@@ -394,49 +376,78 @@ struct Pod {
         double dy = currentCp.y - simPod.y;
         double norm = max(1.0, dist);
         double speedToward = (simPod.vx * dx + simPod.vy * dy) / norm;
-        if (isFinalLap()) {
-            return -dist + speedToward * SCORE_SPEED_TOWARD_FINAL + bonus;
-        }
         return -dist + speedToward * SCORE_SPEED_TOWARD_NORMAL + bonus;
     }
 
-    // Try different (angle, thrust) for first 3 moves, simulate N frames, pick best
+    double closestEnemyDistSq() const {
+        double minDistSq = 1e18;
+        for (int i = 1; i < otherCount; i++) {
+            double dx = x - others[i].x, dy = y - others[i].y;
+            double d = dx*dx + dy*dy;
+            if (d < minDistSq) minDistSq = d;
+        }
+        return minDistSq;
+    }
+
+    double closestEnemyRelSpeedSq() const {
+        double maxRelSq = 0;
+        for (int i = 1; i < otherCount; i++) {
+            double dx = x - others[i].x, dy = y - others[i].y;
+            double distSq = dx*dx + dy*dy;
+            if (distSq < SHIELD_CHECK_DIST * SHIELD_CHECK_DIST) {
+                double rvx = vx - others[i].vx, rvy = vy - others[i].vy;
+                double relSq = rvx*rvx + rvy*rvy;
+                if (relSq > maxRelSq) maxRelSq = relSq;
+            }
+        }
+        return maxRelSq;
+    }
+
     void findBestMove() {
-        precomputeOpponent();
+        precomputeOthers();
 
         SimState initial = {
-            (double)position.x, (double)position.y,
-            vx, vy, facingAngleDeg, 0, shieldCooldown, false
+            x, y, vx, vy, facingAngle, 0, shieldCooldown, false, false, false
         };
 
-        Point currentCp = targetPosition;
-        currentCpIndex = getCpIndex(currentCp);
-        Point nextCp = getNextCheckpoint(currentCp);
+        Point currentCp = getNextCp();
+        Point nextCp = getAfterNextCp();
 
         double bestScoreNormal = -1e18, bestScoreBoost = -1e18, bestScoreShield = -1e18;
-        int bestThrustNormal = 100, bestThrustBoost = 650, bestThrustShield = SHIELD_THRUST_VALUE;
+        int bestThrustNormal = 100;
         double bestAngleNormal = 0, bestAngleBoost = 0, bestAngleShield = 0;
 
-        double dirToCp = atan2(currentCp.y - position.y,
-                               currentCp.x - position.x) * 180.0 / M_PI;
+        // If we'll pass through current CP this frame and no enemy nearby, aim at next CP
+        bool willReachCp = segmentIntersectsCircle(x, y, x + vx, y + vy,
+                                                    currentCp.x, currentCp.y, CP_RADIUS);
+        bool enemyFar = closestEnemyDistSq() > 4 * COLLISION_RADIUS * COLLISION_RADIUS;
+        Point aimCp = (willReachCp && enemyFar) ? nextCp : currentCp;
 
-        bool canBoost = boostAvailable && trackComplete && next_checkpoint_dist > BOOST_MIN_DIST;
-        double opDistSq = (position.x - opponentPos.x) * (position.x - opponentPos.x)
-                        + (position.y - opponentPos.y) * (position.y - opponentPos.y);
-        double relVxSq = (vx - opVx) * (vx - opVx) + (vy - opVy) * (vy - opVy);
+        double dirToCp;
+        if (isBlocker) {
+            dirToCp = atan2(leadEnemyY - y, leadEnemyX - x);
+        } else {
+            dirToCp = atan2(aimCp.y - y, aimCp.x - x);
+        }
+        double distToCp = sqrt((currentCp.x - x) * (currentCp.x - x) +
+                               (currentCp.y - y) * (currentCp.y - y));
+
+        bool canBoost = boostAvailable && currentLap >= BOOST_MIN_LAP && distToCp > BOOST_MIN_DIST;
+
+        double minOtherDistSq = closestEnemyDistSq();
+        double maxRelSpeedSq = closestEnemyRelSpeedSq();
         bool canShield = shieldCooldown == 0
-            && opDistSq < SHIELD_CHECK_DIST * SHIELD_CHECK_DIST
-            && relVxSq > SHIELD_MIN_REL_SPEED_SQ;
-        if (opDistSq < SHIELD_CHECK_DIST * SHIELD_CHECK_DIST) {
-            cerr << "Collision: relV²=" << relVxSq
-                 << " vx=" << vx << " vy=" << vy
-                 << " opVx=" << opVx << " opVy=" << opVy
-                 << " dist=" << sqrt(opDistSq)
+            && minOtherDistSq < SHIELD_CHECK_DIST * SHIELD_CHECK_DIST
+            && maxRelSpeedSq > SHIELD_MIN_REL_SPEED_SQ;
+
+        if (minOtherDistSq < SHIELD_CHECK_DIST * SHIELD_CHECK_DIST) {
+            cerr << "Collision: relV²=" << maxRelSpeedSq
+                 << " dist=" << sqrt(minOtherDistSq)
                  << " shield=" << (canShield ? "available" : "no") << endl;
         }
 
-        // Build step 0 thrust options dynamically
-        int step0Thrusts[THRUST_COUNT_1 + 2]; // +boost +shield max
+        // Build step 0 thrust options
+        int step0Thrusts[THRUST_COUNT_1 + 2];
         int step0ThrustCount = THRUST_COUNT_1;
         for (int i = 0; i < THRUST_COUNT_1; i++) step0Thrusts[i] = THRUST_OPTIONS_1[i];
         if (canBoost) step0Thrusts[step0ThrustCount++] = 650;
@@ -444,35 +455,33 @@ struct Pod {
 
         for (int ai1 = 0; ai1 < ANGLE_COUNT_1; ai1++) {
             for (int ti1 = 0; ti1 < step0ThrustCount; ti1++) {
-                // Step 0
                 double moveAngle1 = dirToCp + ANGLE_OFFSETS_1[ai1];
-                Point simTarget0 = currentCp;
+                int simCpId0 = nextCpId;
                 int arrival0 = -1;
                 SimState afterStep0 = simCandidate(initial, moveAngle1, step0Thrusts[ti1],
-                                                    0, simTarget0, arrival0, currentCp, nextCp);
+                                                    0, simCpId0, arrival0, currentCp, nextCp);
 
                 for (int ai2 = 0; ai2 < ANGLE_COUNT_23; ai2++) {
                     for (int ti2 = 0; ti2 < THRUST_COUNT_23; ti2++) {
-                        // Step 1
-                        double dirFromStep0 = afterStep0.angleTo(simTarget0.x, simTarget0.y);
-                        Point simTarget1 = simTarget0;
+                        Point target1 = checkpoints[simCpId0];
+                        double dirFromStep0 = afterStep0.angleTo(target1.x, target1.y);
+                        int simCpId1 = simCpId0;
                         int arrival1 = arrival0;
                         SimState afterStep1 = simCandidate(afterStep0, dirFromStep0 + ANGLE_OFFSETS_23[ai2],
-                                                            THRUST_OPTIONS_23[ti2], 1, simTarget1, arrival1,
+                                                            THRUST_OPTIONS_23[ti2], 1, simCpId1, arrival1,
                                                             currentCp, nextCp);
 
                         for (int ai3 = 0; ai3 < ANGLE_COUNT_23; ai3++) {
                             for (int ti3 = 0; ti3 < THRUST_COUNT_23; ti3++) {
-                                // Step 2
-                                double dirFromStep1 = afterStep1.angleTo(simTarget1.x, simTarget1.y);
-                                Point simTarget = simTarget1;
+                                Point target2 = checkpoints[simCpId1];
+                                double dirFromStep1 = afterStep1.angleTo(target2.x, target2.y);
+                                int simCpId = simCpId1;
                                 int arrivalFrame = arrival1;
                                 SimState simPod = simCandidate(afterStep1, dirFromStep1 + ANGLE_OFFSETS_23[ai3],
-                                                               THRUST_OPTIONS_23[ti3], 2, simTarget, arrivalFrame,
+                                                               THRUST_OPTIONS_23[ti3], 2, simCpId, arrivalFrame,
                                                                currentCp, nextCp);
 
-                                // Heuristic rollout for remaining steps
-                                simPod = rollout(simPod, 3, simTarget, arrivalFrame, currentCp, nextCp);
+                                simPod = rollout(simPod, 3, simCpId, arrivalFrame, currentCp, nextCp);
 
                                 double score = evaluateScore(simPod, arrivalFrame, currentCp, nextCp);
                                 int t1 = step0Thrusts[ti1];
@@ -503,10 +512,9 @@ struct Pod {
         // Use boost only if it gives significant advantage
         if (canBoost && bestScoreBoost > bestScoreNormal + BOOST_SCORE_THRESHOLD) {
             thrust = 650;
-            double rad = bestAngleBoost * M_PI / 180.0;
             targetPosition = Point(
-                position.x + (int)(TARGET_POINT_DIST * cos(rad)),
-                position.y + (int)(TARGET_POINT_DIST * sin(rad))
+                (int)(x + TARGET_POINT_DIST * cos(bestAngleBoost)),
+                (int)(y + TARGET_POINT_DIST * sin(bestAngleBoost))
             );
             return;
         }
@@ -519,29 +527,23 @@ struct Pod {
         }
         if (canShield && bestScoreShield > bestScoreNormal + SHIELD_SCORE_THRESHOLD) {
             thrust = SHIELD_THRUST_VALUE;
-            double rad = bestAngleShield * M_PI / 180.0;
             targetPosition = Point(
-                position.x + (int)(TARGET_POINT_DIST * cos(rad)),
-                position.y + (int)(TARGET_POINT_DIST * sin(rad))
+                (int)(x + TARGET_POINT_DIST * cos(bestAngleShield)),
+                (int)(y + TARGET_POINT_DIST * sin(bestAngleShield))
             );
             return;
         }
 
         thrust = bestThrustNormal;
-        double rad = bestAngleNormal * M_PI / 180.0;
         targetPosition = Point(
-            position.x + (int)(TARGET_POINT_DIST * cos(rad)),
-            position.y + (int)(TARGET_POINT_DIST * sin(rad))
+            (int)(x + TARGET_POINT_DIST * cos(bestAngleNormal)),
+            (int)(y + TARGET_POINT_DIST * sin(bestAngleNormal))
         );
-
     }
 
-
     void navigate() {
-        // Decrement shield cooldown each frame
         if (shieldCooldown > 0) shieldCooldown--;
 
-        // Failsafe: if stuck at thrust=0 too long, force movement
         if (thrust == 0) {
             zeroThrustFrames++;
             if (zeroThrustFrames > ZERO_THRUST_MAX_FRAMES) {
@@ -566,54 +568,91 @@ struct Pod {
         }
     }
 
-    bool firstFrame;
-    bool opFirstFrame;
-    Point position;
-    Point prevPosition;
-    Point targetPosition;
-    Point opponentPos;
-    Point prevOpponentPos;
-    int next_checkpoint_dist;
-    int next_checkpoint_angle;
-    double facingAngleDeg;
-    int thrust;
-    int currentCpIndex;
-    int shieldCooldown;
-    int zeroThrustFrames;
-    double vx, vy;
-    double opVx, opVy;
+    static void assignRoles(Pod& a, Pod& b) {
+        if (a.totalCpsPassed > b.totalCpsPassed) {
+            a.isBlocker = false;
+            b.isBlocker = true;
+        } else if (b.totalCpsPassed > a.totalCpsPassed) {
+            a.isBlocker = true;
+            b.isBlocker = false;
+        } else {
+            double da = a.distSqToNextCp();
+            double db = b.distSqToNextCp();
+            a.isBlocker = da > db;
+            b.isBlocker = db >= da;
+        }
+    }
+
+    double distSqToNextCp() const {
+        double dx = checkpoints[nextCpId].x - x;
+        double dy = checkpoints[nextCpId].y - y;
+        return dx*dx + dy*dy;
+    }
+
+    static int findLeadOpponent(int px[], int py[], int pcpid[]) {
+        if (pcpid[3] > pcpid[2]) return 3;
+        if (pcpid[2] > pcpid[3]) return 2;
+        double d2 = (checkpoints[pcpid[2]].x - px[2]) * (checkpoints[pcpid[2]].x - px[2])
+                   + (checkpoints[pcpid[2]].y - py[2]) * (checkpoints[pcpid[2]].y - py[2]);
+        double d3 = (checkpoints[pcpid[3]].x - px[3]) * (checkpoints[pcpid[3]].x - px[3])
+                   + (checkpoints[pcpid[3]].y - py[3]) * (checkpoints[pcpid[3]].y - py[3]);
+        return (d3 < d2) ? 3 : 2;
+    }
+
+    void receiveTeammateMove(const Pod& teammate) {
+        hasTeammateMove = true;
+        teammateAngle = atan2(teammate.targetPosition.y - teammate.y,
+                              teammate.targetPosition.x - teammate.x);
+        teammateThrust = (teammate.thrust == 650) ? 650 :
+                          (teammate.thrust == SHIELD_THRUST_VALUE ? 0 : teammate.thrust);
+        teammateFacing = teammate.facingAngle;
+    }
 };
 
-
 int main() {
-    Pod pod;
+    cin >> totalLaps; cin.ignore();
+    cin >> checkpointCount; cin.ignore();
+    for (int i = 0; i < checkpointCount; i++) {
+        cin >> checkpoints[i].x >> checkpoints[i].y; cin.ignore();
+    }
 
-    int i=0;
-    while (++i) {
-        int x;
-        int y;
-        int next_checkpoint_x; // x position of the next check point
-        int next_checkpoint_y; // y position of the next check point
-        int next_checkpoint_dist; // distance to the next checkpoint
-        int next_checkpoint_angle; // angle between your pod orientation and the direction of the next checkpoint
-        cin >> x >> y >> next_checkpoint_x >> next_checkpoint_y >> next_checkpoint_dist >> next_checkpoint_angle; cin.ignore();
-        int opponent_x;
-        int opponent_y;
-        cin >> opponent_x >> opponent_y; cin.ignore();
+    Pod pods[2];
+    int turn = 0;
 
-        const Point cp(next_checkpoint_x, next_checkpoint_y);
-        if (i == 1) pod.initStartPosition(x, y);
-        pod.trackCheckpoint(cp);
-        pod.computeVelocity(x, y);
-        pod.computeOpponent(opponent_x, opponent_y);
-        pod.setPos(x, y);
-        pod.setNextCheckpointAngle(next_checkpoint_angle);
-        pod.setDistance(next_checkpoint_dist);
-        pod.setTargetPosition(cp);
-        pod.computeFacingAngle(next_checkpoint_x, next_checkpoint_y);
+    while (true) {
+        turn++;
+        int px[4], py[4], pvx[4], pvy[4], pangle[4], pcpid[4];
+        for (int i = 0; i < 4; i++) {
+            cin >> px[i] >> py[i] >> pvx[i] >> pvy[i] >> pangle[i] >> pcpid[i]; cin.ignore();
+        }
 
-        pod.findBestMove();
-        pod.navigate();
+        for (int i = 0; i < 2; i++) {
+            pods[i].setState(px[i], py[i], pvx[i], pvy[i], pangle[i], pcpid[i]);
+        }
+
+        Pod::assignRoles(pods[0], pods[1]);
+
+        int leadOp = Pod::findLeadOpponent(px, py, pcpid);
+        for (int i = 0; i < 2; i++) {
+            pods[i].leadEnemyX = px[leadOp];
+            pods[i].leadEnemyY = py[leadOp];
+
+            Pod::OtherPodState others[3];
+            int other = 1 - i;
+            others[0] = {(double)px[other], (double)py[other], (double)pvx[other], (double)pvy[other]};
+            others[1] = {(double)px[2], (double)py[2], (double)pvx[2], (double)pvy[2]};
+            others[2] = {(double)px[3], (double)py[3], (double)pvx[3], (double)pvy[3]};
+            pods[i].setOthers(others, 3);
+        }
+
+        pods[0].hasTeammateMove = false;
+        pods[0].findBestMove();
+
+        pods[1].receiveTeammateMove(pods[0]);
+        pods[1].findBestMove();
+
+        pods[0].navigate();
+        pods[1].navigate();
 
     }
 }
