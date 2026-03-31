@@ -26,12 +26,12 @@ constexpr double SCORE_CP_PASSED = 50000.0;
 constexpr double SCORE_EARLY_ARRIVAL = 5000.0;
 constexpr double SCORE_SPEED_WEIGHT_FINAL = 0.025;
 constexpr double SCORE_SPEED_TOWARD_NORMAL = 3.0;
-constexpr double SCORE_SPEED_TOWARD_FINAL = 10.0;
+constexpr double SCORE_SPEED_TOWARD_FINAL = 15.0;
 constexpr double SCORE_DIST_TO_NEXT_WEIGHT = 2.0;
 
 // Boost
-constexpr int BOOST_MIN_DIST = 5500;
-constexpr int BOOST_MIN_LAP = 2;
+constexpr int BOOST_MIN_DIST = 3500;
+constexpr int BOOST_MIN_LAP = 1;
 constexpr double BOOST_SCORE_THRESHOLD = 10000.0;
 
 // Shield
@@ -45,7 +45,11 @@ constexpr double SHIELD_COLLISION_BONUS = 18000.0;
 constexpr double SHIELD_COLLISION_BONUS_BLOCKER = 35000.0;
 constexpr double SHIELD_MIN_REL_SPEED_SQ = 125000.0;
 constexpr double BOOST_COLLISION_BONUS_BLOCKER = 12500.0;
-constexpr double TEAMMATE_COLLISION_PENALTY = 20000.0;
+constexpr double TEAMMATE_COLLISION_PENALTY = 25000.0;
+constexpr double TEAMMATE_COLLISION_PENALTY_PER_LAP = 15000.0;
+constexpr double INTERCEPT_URGENCY_PER_ENEMY = 0.51;
+constexpr double INTERCEPT_DIST_THRESHOLD = 2000.0;
+constexpr double INTERCEPT_PATH_RADIUS = 2000.0;
 
 // Search: step 0
 constexpr double ANGLE_OFFSETS_1[] = {
@@ -86,6 +90,7 @@ struct Point {
 };
 
 Point checkpoints[20];
+double distNormCoeff = 1.0;
 
 template<typename K>
 ostream& operator<<(ostream& os, const vector<K>& v) {
@@ -155,11 +160,17 @@ struct Pod {
 
     // Role
     bool isBlocker = false;
+    double interceptUrgency = 0.0; // 0.0 = race, 0.5 = one enemy ahead, 1.0 = both enemies ahead
     double leadEnemyX, leadEnemyY;
+    int leadEnemyIdx = -1; // index in others[] array (1 or 2)
+    int leadEnemyNextCpId = 0; // enemy's next checkpoint
 
     // Output
     Point targetPosition;
     int thrust;
+    double chosenScore;
+    int podIndex = 0;
+    vector<int> scoreHistory = vector<int>(500);
 
     // Other pods for collision prediction
     static constexpr int MAX_OTHERS = 3;
@@ -320,7 +331,7 @@ struct Pod {
                     s.teammateCollided = true;
                 } else {
                     if (myMass > NORMAL_MASS) s.shieldCollided = true;
-                    if (simThrust == 650) s.boostCollided = true;
+                    if (simThrust == 650 && p == leadEnemyIdx) s.boostCollided = true;
                 }
             }
         }
@@ -352,8 +363,7 @@ struct Pod {
         return s;
     }
 
-    double evaluateScore(const SimState& simPod, int arrivalFrame,
-                         const Point& currentCp, const Point& nextCp) {
+    double collisionBonus(const SimState& simPod) const {
         double bonus = 0.0;
         if (simPod.shieldCollided) {
             bonus = isBlocker ? SHIELD_COLLISION_BONUS_BLOCKER : SHIELD_COLLISION_BONUS;
@@ -361,22 +371,39 @@ struct Pod {
             bonus = BOOST_COLLISION_BONUS_BLOCKER;
         }
         if (simPod.teammateCollided) {
-            bonus -= TEAMMATE_COLLISION_PENALTY;
+            bonus -= TEAMMATE_COLLISION_PENALTY + TEAMMATE_COLLISION_PENALTY_PER_LAP * currentLap;
         }
+        return bonus;
+    }
+
+    double approachScore(const SimState& simPod, double tx, double ty, double speedWeight = SCORE_SPEED_TOWARD_NORMAL) const {
+        double dist = simPod.distTo(tx, ty);
+        double dx = tx - simPod.x;
+        double dy = ty - simPod.y;
+        double norm = max(1.0, dist);
+        double speedToward = (simPod.vx * dx + simPod.vy * dy) / norm;
+        return -dist * distNormCoeff + speedToward * speedWeight;
+    }
+
+    double evaluateScore(const SimState& simPod, int arrivalFrame,
+                         const Point& currentCp, const Point& nextCp) {
+        double bonus = collisionBonus(simPod);
 
         if (simPod.cpsPassed > 0) {
             double score = simPod.cpsPassed * SCORE_CP_PASSED
                          + (SIM_DEPTH - arrivalFrame) * SCORE_EARLY_ARRIVAL + bonus;
-            double distToNext = simPod.distTo(nextCp.x, nextCp.y);
-            score -= distToNext * SCORE_DIST_TO_NEXT_WEIGHT;
+            score -= simPod.distTo(nextCp.x, nextCp.y) * SCORE_DIST_TO_NEXT_WEIGHT;
             return score;
         }
-        double dist = simPod.distTo(currentCp.x, currentCp.y);
-        double dx = currentCp.x - simPod.x;
-        double dy = currentCp.y - simPod.y;
-        double norm = max(1.0, dist);
-        double speedToward = (simPod.vx * dx + simPod.vy * dy) / norm;
-        return -dist + speedToward * SCORE_SPEED_TOWARD_NORMAL + bonus;
+
+        double raceScore = approachScore(simPod, currentCp.x, currentCp.y);
+
+        if (isBlocker && interceptUrgency > 0.0) {
+            Point enemyCp = checkpoints[leadEnemyNextCpId];
+            double interceptScore = approachScore(simPod, enemyCp.x, enemyCp.y, SCORE_SPEED_TOWARD_FINAL);
+            return max(raceScore, interceptScore) + bonus;
+        }
+        return raceScore + bonus;
     }
 
     double closestEnemyDistSq() const {
@@ -424,7 +451,10 @@ struct Pod {
         Point aimCp = (willReachCp && enemyFar) ? nextCp : currentCp;
 
         double dirToCp;
-        if (isBlocker) {
+        if (isBlocker && interceptUrgency > 0.0) {
+            Point enemyCp = checkpoints[leadEnemyNextCpId];
+            dirToCp = atan2(enemyCp.y - y, enemyCp.x - x);
+        } else if (isBlocker) {
             dirToCp = atan2(leadEnemyY - y, leadEnemyX - x);
         } else {
             dirToCp = atan2(aimCp.y - y, aimCp.x - x);
@@ -512,6 +542,7 @@ struct Pod {
         // Use boost only if it gives significant advantage
         if (canBoost && bestScoreBoost > bestScoreNormal + BOOST_SCORE_THRESHOLD) {
             thrust = 650;
+            chosenScore = bestScoreBoost;
             targetPosition = Point(
                 (int)(x + TARGET_POINT_DIST * cos(bestAngleBoost)),
                 (int)(y + TARGET_POINT_DIST * sin(bestAngleBoost))
@@ -527,6 +558,7 @@ struct Pod {
         }
         if (canShield && bestScoreShield > bestScoreNormal + SHIELD_SCORE_THRESHOLD) {
             thrust = SHIELD_THRUST_VALUE;
+            chosenScore = bestScoreShield;
             targetPosition = Point(
                 (int)(x + TARGET_POINT_DIST * cos(bestAngleShield)),
                 (int)(y + TARGET_POINT_DIST * sin(bestAngleShield))
@@ -535,6 +567,7 @@ struct Pod {
         }
 
         thrust = bestThrustNormal;
+        chosenScore = bestScoreNormal;
         targetPosition = Point(
             (int)(x + TARGET_POINT_DIST * cos(bestAngleNormal)),
             (int)(y + TARGET_POINT_DIST * sin(bestAngleNormal))
@@ -554,17 +587,24 @@ struct Pod {
             zeroThrustFrames = 0;
         }
 
+        if (isBlocker) {
+            cerr << "P" << podIndex << " blocker urg=" << interceptUrgency
+                 << " eCpId=" << leadEnemyNextCpId
+                 << " thrust=" << thrust << endl;
+        }
+
+        string msg = (podIndex == 0) ? "raka maka foo" : "fristaylo";
         cout << targetPosition.x << " " << targetPosition.y << " ";
         if (thrust == 650) {
-            cout << "BOOST" << endl;
+            cout << "BOOST " << msg << endl;
             boostAvailable = false;
             cerr << "BOOST activated!" << endl;
         } else if (thrust == SHIELD_THRUST_VALUE) {
-            cout << "SHIELD" << endl;
+            cout << "SHIELD " << msg << endl;
             shieldCooldown = SHIELD_COOLDOWN;
             cerr << "SHIELD activated!" << endl;
         } else {
-            cout << thrust << endl;
+            cout << thrust << " " << msg << endl;
         }
     }
 
@@ -589,6 +629,39 @@ struct Pod {
         return dx*dx + dy*dy;
     }
 
+    static bool isEnemyAhead(int enemyCps, int ourBestCps, double enemyDistSq, double ourBestDistSq) {
+        if (enemyCps > ourBestCps) return true;
+        if (enemyCps == ourBestCps && ourBestDistSq - enemyDistSq > INTERCEPT_DIST_THRESHOLD * INTERCEPT_DIST_THRESHOLD) return true;
+        return false;
+    }
+
+    static void calcInterceptUrgency(Pod& a, Pod& b, int enemyCps[], int px[], int py[], int pcpid[]) {
+        int ourBestCpsPassed = max(a.totalCpsPassed, b.totalCpsPassed);
+        double ourBestDistSq = min(a.distSqToNextCp(), b.distSqToNextCp());
+
+        int enemiesAhead = 0;
+        for (int e = 0; e < 2; e++) {
+            double edx = checkpoints[pcpid[2+e]].x - px[2+e];
+            double edy = checkpoints[pcpid[2+e]].y - py[2+e];
+            double enemyDistSq = edx*edx + edy*edy;
+            if (isEnemyAhead(enemyCps[e], ourBestCpsPassed, enemyDistSq, ourBestDistSq)) enemiesAhead++;
+        }
+
+        // Check if blocker's path to own CP passes near enemy's CP
+        Pod& blocker = a.isBlocker ? a : b;
+        Point blockerCp = blocker.getNextCp();
+        int leadOp = findLeadOpponent(px, py, pcpid);
+        Point enemyCp = checkpoints[pcpid[leadOp]];
+        bool pathCrossesEnemy = segmentIntersectsCircle(
+            blocker.x, blocker.y, blockerCp.x, blockerCp.y,
+            enemyCp.x, enemyCp.y, INTERCEPT_PATH_RADIUS);
+        if (pathCrossesEnemy && enemiesAhead == 0) enemiesAhead = 1;
+
+        double urgency = enemiesAhead * INTERCEPT_URGENCY_PER_ENEMY;
+        a.interceptUrgency = a.isBlocker ? urgency : 0.0;
+        b.interceptUrgency = b.isBlocker ? urgency : 0.0;
+    }
+
     static int findLeadOpponent(int px[], int py[], int pcpid[]) {
         if (pcpid[3] > pcpid[2]) return 3;
         if (pcpid[2] > pcpid[3]) return 2;
@@ -609,6 +682,19 @@ struct Pod {
     }
 };
 
+void computeDistNormCoeff() {
+    double totalDist = 0;
+    for (int i = 0; i < checkpointCount; i++) {
+        int ni = (i + 1) % checkpointCount;
+        double dx = checkpoints[ni].x - checkpoints[i].x;
+        double dy = checkpoints[ni].y - checkpoints[i].y;
+        totalDist += sqrt(dx*dx + dy*dy);
+    }
+    double avgDist = totalDist / checkpointCount;
+    double ratio = avgDist / 18000.0;
+    distNormCoeff = ratio * ratio;
+}
+
 int main() {
     cin >> totalLaps; cin.ignore();
     cin >> checkpointCount; cin.ignore();
@@ -616,8 +702,15 @@ int main() {
         cin >> checkpoints[i].x >> checkpoints[i].y; cin.ignore();
     }
 
+    computeDistNormCoeff();
+
     Pod pods[2];
+    pods[0].podIndex = 0;
+    pods[1].podIndex = 1;
     int turn = 0;
+    bool showResults = true;
+    int enemyCpsPassed[2] = {0, 0};
+    int enemyPrevCpId[2] = {-1, -1};
 
     while (true) {
         turn++;
@@ -630,12 +723,21 @@ int main() {
             pods[i].setState(px[i], py[i], pvx[i], pvy[i], pangle[i], pcpid[i]);
         }
 
+        for (int e = 0; e < 2; e++) {
+            int cpId = pcpid[2 + e];
+            if (enemyPrevCpId[e] >= 0 && cpId != enemyPrevCpId[e]) enemyCpsPassed[e]++;
+            enemyPrevCpId[e] = cpId;
+        }
+
         Pod::assignRoles(pods[0], pods[1]);
 
         int leadOp = Pod::findLeadOpponent(px, py, pcpid);
+        Pod::calcInterceptUrgency(pods[0], pods[1], enemyCpsPassed, px, py, pcpid);
         for (int i = 0; i < 2; i++) {
             pods[i].leadEnemyX = px[leadOp];
             pods[i].leadEnemyY = py[leadOp];
+            pods[i].leadEnemyNextCpId = pcpid[leadOp];
+            pods[i].leadEnemyIdx = (leadOp == 2) ? 1 : 2; // others[1]=px[2], others[2]=px[3]
 
             Pod::OtherPodState others[3];
             int other = 1 - i;
@@ -651,8 +753,32 @@ int main() {
         pods[1].receiveTeammateMove(pods[0]);
         pods[1].findBestMove();
 
+        for (int i = 0; i < 2; i++) {
+            if (turn <= 500) pods[i].scoreHistory[turn - 1] = (int)pods[i].chosenScore;
+        }
+
         pods[0].navigate();
         pods[1].navigate();
 
+        if (showResults) {
+            bool anyReady = false;
+            for (int i = 0; i < 2; i++) {
+                if (pods[i].currentLap == totalLaps
+                    && pods[i].nextCpId == 0
+                    && pods[i].distSqToNextCp() < 3000.0 * 3000.0) {
+                    anyReady = true;
+                }
+            }
+            if (anyReady) {
+                int count = min(turn, 500);
+                for (int i = 0; i < 2; i++) {
+                    int sum = 0;
+                    for (int t = 0; t < count; t++) sum += pods[i].scoreHistory[t];
+                    cerr << "Pod" << i << " score: " << sum
+                         << " turns: " << count << endl;
+                }
+                showResults = false;
+            }
+        }
     }
 }
