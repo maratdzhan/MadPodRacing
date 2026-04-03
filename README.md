@@ -13,194 +13,215 @@ Bot for CodinGame Mad Pod Racing (Gold League input format). Controls two pods r
 
 ---
 
-## Architecture
+## Type Hierarchy
 
-### Constants
+```
+SimpleStateCoords {x, y}          — position only, base for everything
+SimpleStateSpeeds {vx, vy}        — velocity only
 
-All tunable parameters are `constexpr` at the top of the file. All angles are stored and computed in **radians** — the only degree-to-radian conversion happens once at input (`angleDeg * DEG_TO_RAD`).
+PodBaseState : SimpleStateCoords, SimpleStateSpeeds {modified}
+  — lightweight move data for othersAfterMove/othersFinal in collision sim
+  — 5 fields, no methods, trivial construction
 
-| Group | Constants | Purpose |
-|-------|-----------|---------|
-| Physics | `FRICTION=0.85`, `MAX_TURN=18*pi/180`, `CP_RADIUS=590`, `CP_RADIUS_REDUCTION=10`, `COLLISION_RADIUS=800`, `MIN_COLLISION_IMPULSE=120`, `DEG_TO_RAD` | Game engine physics |
-| Simulation | `SIM_DEPTH=4`, `ZERO_THRUST_MAX_FRAMES=7`, `ZERO_THRUST_OVERRIDE=20`, `TARGET_POINT_DIST=10000` | Search depth, failsafe |
-| Scoring | `SCORE_CP_PASSED=50000`, `SCORE_EARLY_ARRIVAL=5000`, `SCORE_SPEED_TOWARD_NORMAL=3.0`, `SCORE_SPEED_TOWARD_FINAL=10.0` (intercept), `SCORE_DIST_TO_NEXT_WEIGHT=2.0` | Evaluation weights. Uniform across all laps. |
-| Boost | `BOOST_MIN_DIST`, `BOOST_MIN_LAP=2`, `BOOST_SCORE_THRESHOLD=10000` | Boost eligibility: not on lap 1 |
-| Shield | `SHIELD_THRUST_VALUE=-1`, `SHIELD_COOLDOWN=3`, `SHIELD_MASS=10`, `NORMAL_MASS=1`, `SHIELD_CHECK_DIST=1200`, `SHIELD_SCORE_THRESHOLD=0`, `SHIELD_COLLISION_BONUS=18000` (racer) / `SHIELD_COLLISION_BONUS_BLOCKER=35000` (blocker), `SHIELD_MIN_REL_SPEED_SQ=125000` | Shield activation and scoring |
-| Blocker | `BOOST_COLLISION_BONUS_BLOCKER=12500`, `TEAMMATE_COLLISION_PENALTY=25000`, `TEAMMATE_COLLISION_PENALTY_PER_LAP=15000` | Collision bonuses/penalties |
-| Intercept | `INTERCEPT_URGENCY_PER_ENEMY=0.51`, `INTERCEPT_DIST_THRESHOLD=2000`, `INTERCEPT_PATH_RADIUS=2000` | Intercept urgency triggers |
-| Search step 0 | `ANGLE_OFFSETS_1[]` (12 values in radians: -50 to +50 deg, plus pi), `THRUST_OPTIONS_1[]` (6 values) | Branching for first search step |
-| Search steps 1-2 | `ANGLE_OFFSETS_23[]` (6 values: -24 to +24 deg, plus pi), `THRUST_OPTIONS_23[]` (4 values) | Reduced branching for deeper steps |
+PodBase : SimpleStateCoords, SimpleStateSpeeds {facingAngle, nextCpId, modified}
+  — enemy tracking in search (enemies0/1/2 arrays)
+  — ~56 bytes, update/get methods, no prev-tracking
+  — static: boostHoldTurns, currentTurn
 
-### Global State
+SimState : PodBase {prevX, prevY, cpsPassed, shieldTurnsLeft,
+                    shieldCollided, boostCollided, teammateCollided, minEnemyDistSq}
+  — our pod during simulation, ~80 bytes
+  — updateX/Y saves prevX/prevY (for checkpoint detection)
+  — setAfterCollisionX/Y writes without saving prev (for post-collision adjustments)
+  — getPrevX/Y for checkpoint segment start point
 
-- `totalLaps`, `checkpointCount`, `checkpoints[20]` — read at initialization
-- `distNormCoeff` — quadratic distance normalization coefficient, computed once: `(avgDist / 18000)²` where `avgDist` = average distance between consecutive checkpoints
+Pod : PodBase {shieldCooldown, boostAvailable, currentLap, totalCpsPassed, ...}
+  — full game-time pod with persistent state, search, navigation, scoring
+  — contains others[3] (PodBase), otherPredictions, all simulation methods
+```
 
-### Point
-
-Simple `{x, y}` struct with `==`, `!=`, `+`, `<` operators and `operator<<` for debug output.
-
-### Helper Functions
-
-**`normalizeAngle(angle)`** — wraps angle to [-pi, pi] range. Works in radians.
-
-**`segmentIntersectsCircle(x1,y1, x2,y2, px,py, radius)`** — checks if the line segment passes within `radius` of a point. Solves quadratic for parameter t. Used for: checkpoint detection in simulation, and path-crossing intercept detection.
-
-**`computeDistNormCoeff()`** — computes `distNormCoeff = (avgDist / 18000)²`. Normalizes `-dist` in scoring so it doesn't dominate on large tracks.
-
-### SimState
-
-Simulation-time pod state (all angles in radians):
-
-| Field | Type | Meaning |
-|-------|------|---------|
-| `x, y` | double | Position |
-| `vx, vy` | double | Velocity |
-| `facingAngle` | double | Facing direction (radians) |
-| `cpsPassed` | int | Checkpoints passed during simulation |
-| `shieldTurnsLeft` | int | Shield cooldown remaining |
-| `shieldCollided` | bool | Collision with shield active (enemy only) |
-| `boostCollided` | bool | Collision while boosting (enemy only, lead enemy only) |
-| `teammateCollided` | bool | Collision with teammate |
+Design principle: heavier types only where needed. Enemies use `PodBase` (~56 bytes), move data uses `PodBaseState` (~40 bytes), only our simulated pod uses `SimState` (~80 bytes).
 
 ---
 
-## Pod — Main Structure
+## Constants
 
-### Roles: Racer vs Blocker
+All tunable parameters are `constexpr` at the top. All angles in **radians** — single deg→rad conversion at input.
 
-Each frame, `assignRoles()` designates one pod as **racer** (further ahead by CPs passed, or closer to next CP if tied) and one as **blocker**.
+| Group | Key Constants |
+|-------|---------------|
+| Physics | `FRICTION=0.85`, `CP_RADIUS=585`, `COLLISION_RADIUS=800`, `MAX_TURN=18°`, `MIN_COLLISION_IMPULSE=120` |
+| Simulation | `SIM_DEPTH=4`, `TARGET_POINT_DIST=10000` |
+| Scoring | `SCORE_CP_PASSED=25000`, `SCORE_EARLY_ARRIVAL=5000`, `SCORE_SPEED_TOWARD_NORMAL=3.0`, `SCORE_SPEED_TOWARD_FINAL=15.0`, `SCORE_DIST_TO_NEXT_WEIGHT=5.0` |
+| Boost | `BOOST_MIN_DIST=4500`, `BOOST_MIN_LAP=1`, `BOOST_MIN_TURN=10`, `BOOST_SCORE_THRESHOLD=10000` |
+| Shield | `SHIELD_COOLDOWN=3`, `SHIELD_MASS=10`, `SHIELD_COLLISION_BONUS=18000` (racer) / `35000` (blocker) |
+| Intercept | `INTERCEPT_URGENCY_PER_ENEMY=0.51`, `INTERCEPT_DIST_THRESHOLD=2000`, `INTERCEPT_PATH_RADIUS=2000`, `BLOCKER_PASSIVE_INTERCEPT_WEIGHT=0.25` |
+| Search step 0 | `ANGLE_OFFSETS_1[]`: -27°, -15°, -7°, 0, +7°, +15°, +27°, π (8 angles), `THRUST_OPTIONS_1[]`: 10, 42, 75, 100, 0 (5 thrusts) |
+| Search steps 1-2 | `ANGLE_OFFSETS_23[]`: -45°, -15°, 0, +15°, +45°, π (6 angles), `THRUST_OPTIONS_23[]`: 10, 42, 75, 100 (4 thrusts) |
 
-**Racer** behavior:
-- Aims at checkpoints (with early next-CP switch when about to pass current)
-- Standard collision bonuses
+---
 
-**Blocker** behavior:
-- When `interceptUrgency > 0`: search angles centered on **enemy's next checkpoint**
-- When `interceptUrgency == 0`: search angles centered on **leading opponent position** (for close-range encounters)
-- Higher shield collision bonus (35000 vs 18000)
-- Bonus for boost-ramming lead enemy (12500)
-- Shield/boost eligibility checks only consider enemies, not teammate
+## Global State
 
-Both pods penalized for teammate collision: `-(25000 + 15000 * currentLap)`.
+- `totalLaps`, `checkpointCount`, `checkpoints[20]` — from initialization input
+- `distNormCoeff` — `(avgDist / 18000)²`, normalizes `-dist` in scoring across track sizes
 
-### Intercept Urgency System
+---
 
-**`calcInterceptUrgency()`** determines how aggressively the blocker should intercept:
+## Helper Functions
 
-Three triggers (any sets urgency > 0):
-1. **Enemy ahead by CPs**: `enemyCpsPassed > ourBestCpsPassed`
-2. **Enemy ahead by distance**: at equal cpsPassed, if enemy is closer to next CP by more than `INTERCEPT_DIST_THRESHOLD` (2000)
-3. **Path crossing**: blocker's path to own CP passes within `INTERCEPT_PATH_RADIUS` (2000) of enemy's CP — detected via `segmentIntersectsCircle`. This is the most impactful trigger: the blocker intercepts "for free" without deviating from its own race line.
+**`normalizeAngle(angle)`** — wraps to [-π, π] via `fmod` + two `if`. O(1).
 
-Urgency value: `enemiesAhead * INTERCEPT_URGENCY_PER_ENEMY` (0.51 per enemy).
+**`segmentIntersectsCircle(x1,y1, x2,y2, circleX,circleY, radius)`** — quadratic solve for segment-circle intersection. Used for checkpoint detection and path-crossing intercept.
 
-### Scoring
+**`computeDistNormCoeff()`** — computes `distNormCoeff = (avgDist / 18000)²`.
 
-**`collisionBonus(simPod)`** — calculates all collision bonuses/penalties:
-- Shield collision: +18000 (racer) or +35000 (blocker)
-- Boost collision with lead enemy (blocker only): +12500
-- Teammate collision: -(25000 + 15000 * currentLap)
+---
 
-**`approachScore(simPod, tx, ty, speedWeight)`** — evaluates approach to a target point:
-```
--dist * distNormCoeff + speedToward * speedWeight
-```
-Where `distNormCoeff = (avgDist / 18000)²` normalizes distance penalty across different track sizes.
+## Pod Methods — Simulation Engine
 
-**`evaluateScore(simPod, arrivalFrame, currentCp, nextCp)`**:
+### applyRotationAndThrust(podState, targetAngle, simThrust)
 
-If checkpoint reached (`cpsPassed > 0`):
-```
-score = cpsPassed * 50000 + (SIM_DEPTH - arrivalFrame) * 5000 - distToNextCP * 2.0 + bonus
-```
+One-step rotation + thrust on a `PodBase&`. Clamps rotation to `MAX_TURN` (18°), applies thrust in facing direction. Modifies `facingAngle`, `vx`, `vy`.
 
-If not reached:
-- Racer: `approachScore(pod, currentCp, 3.0) + bonus`
-- Blocker with urgency > 0: `max(raceScore, interceptScore) + bonus`
-  - `raceScore` = approachScore toward own CP (weight 3.0)
-  - `interceptScore` = approachScore toward enemy's CP (weight 10.0)
-  - `max()` ensures blocker always commits to whichever direction is better, no paralysis from blending
+### findCollisionTime(startA, endA, startB, endB, radius)
 
-### Search Algorithm — findBestMove()
+Static. Takes 4 `SimpleStateCoords` (start/end positions of two objects) + collision radius. Solves quadratic for time t ∈ [0,1] when objects are within radius. Returns t or -1.
 
-**Setup:**
-1. `precomputeOthers()` with teammate's real move if available
-2. Early CP switch: if current velocity will pass through current CP this frame and enemies are far (> 2*COLLISION_RADIUS), center search on next CP
-3. Blocker with urgency > 0: centers search on enemy's next checkpoint. Without urgency: centers on enemy position.
-4. Boost eligibility: `boostAvailable && currentLap >= BOOST_MIN_LAP && distToCp > BOOST_MIN_DIST`
-5. Shield eligibility: only checks enemy distances/speeds (not teammate)
+### getNextCpIdIfIntersects(from, to, circle, radius, nextCpId)
 
-**Three-level search:**
-- Step 0: 12 angles x 6-8 thrusts = 72-96 branches
-- Step 1: 6 x 4 = 24 branches
-- Step 2: 6 x 4 = 24 branches
-- Step 3: 1 rollout step (SIM_DEPTH=4)
+Checks if segment from→to passes through checkpoint circle. Returns `(nextCpId + 1) % checkpointCount` if yes, else `nextCpId`. Takes `SimpleStateCoords` refs.
 
-**Total:** ~41k–55k candidates per pod.
+### predictPodStep(state, target, podIdx, step)
 
-Three separate best scores (normal, boost, shield). Boost chosen if +10000 over normal. Shield chosen if +0 over normal.
+Predicts one step for another pod (`PodBase& state`). Aims at `target`, computes `angleDependentThrust`, applies rotation+thrust via temp `PodBase`, saves prediction in `otherPredictions[podIdx][step]`, advances position with friction and int truncation. For teammate at step 0 (`hasTeammateMove && step == 0`): uses actual teammate move instead of heuristic.
 
-### Other Pod Prediction
+### precomputeOthers()
 
-**`precomputeOthers()`** — for each other pod:
-- All pods: linear extrapolation (pos += vel, vel *= friction, truncate to int)
-- Teammate (p==0) with `hasTeammateMove`: step 1 uses `simStep()` with actual chosen move, then linear
+Runs `predictPodStep` for all 3 other pods over `SIM_DEPTH` steps. Fills `otherPredictions[3][5]` array. Teammate step 0 uses real move if available.
 
-### Collision Physics
+### computeEnemyMoves(step, others[], othersAfterMove[])
 
-**`applyCollision(s, ox, oy, ovx, ovy, myMass)`** — elastic collision with impulse `max(120, -2 * otherMass * dvn / totalMass)`.
+Fills `PodBaseState othersAfterMove[]` with each pod's start position and post-thrust velocity for this step. For modified enemies: recomputes aim + `applyRotationAndThrust` from current state, updates `others[].facingAngle`. For unmodified: reads from `otherPredictions`.
 
-Collision tracking in `simCandidate`:
-- Hit teammate (p==0): `teammateCollided`
-- Hit enemy with shield (mass > normal): `shieldCollided`
-- Hit lead enemy with boost (thrust==650, p==leadEnemyIdx): `boostCollided`
+### applyMutualCollision(simState, enemy, myMass, otherMass)
 
-**`closestEnemyDistSq()`** / **`closestEnemyRelSpeedSq()`** — skip teammate (others[0]).
+Elastic collision between our pod (`SimState&`) and enemy (`PodBaseState&`). Checks distance < `COLLISION_RADIUS` and closing velocity. Applies impulse `max(120, 2*m1*m2*|dvn|/(m1+m2))`. Overlap push uses `setAfterCollisionX/Y` on simState (preserves prevX) and direct writes on enemy.
 
-### Simulation Engine
+### resolveThrust(simThrust, simState)
 
-**`simStep(s, targetAngle, simThrust)`** — one frame: rotate (max +-18 deg), thrust, move, friction (truncate to int), position truncate.
+Handles shield activation (`shieldTurnsLeft = 3`, return 0) and cooldown (return 0 while cooling). Otherwise returns simThrust.
 
-**`simCandidate(...)`** — full step: resolve thrust, simStep, collisions with all 3 others, dynamic CP radius, segment-circle checkpoint detection.
+### fastPath(simState, step, simNextCpId, arrivalFrame)
 
-**`rollout(s, fromStep, ...)`** — heuristic continuation using `angleDependentThrust`: `max(20, 100 - |angleDiff in degrees|)`.
+No-collision, no-modified-enemies path. Moves position, applies friction+truncation in one `updateX` call (preserves prevX). Tracks min enemy distance, detects checkpoint crossing via `segmentIntersectsCircle(getPrevX, getPrevY, getX, getY, ...)`.
 
-### Output — navigate()
+### slowPath(simState, simThrust, step, simNextCpId, arrivalFrame, earliestCollisionPod, earliestCollisionTime, othersAfterMove[], others[])
 
-1. Decrement shield cooldown
-2. Blocker debug: log urgency, enemy CP, thrust to stderr
-3. Stuck detection: 0-thrust for >7 frames overrides to 20
-4. Output: `targetX targetY BOOST|SHIELD|thrust podName`
+Full collision path. Creates `PodBaseState othersFinal[]` (end-of-step positions). If collision detected: interpolates to collision point (`updateX` — saves prevX), resolves collision (`applyMutualCollision`), continues remaining movement (`setAfterCollisionX` — preserves prevX). Checks secondary collisions with other pods. Calls `updateEnemyStates` to propagate changes. Applies friction. Detects checkpoint crossing.
+
+### simCandidate(simState, aimAngle, simThrust, step, simNextCpId&, arrivalFrame&, others[])
+
+Main simulation step. Resolves thrust, applies rotation+thrust. Calls `computeEnemyMoves` once. Runs collision check loop using `othersAfterMove` data + `findCollisionTime`. If no collision and no modified enemies → `fastPath` + early return. Otherwise → `slowPath`. Returns modified `SimState`. `simNextCpId` and `arrivalFrame` passed by reference — checkpoint progress propagates to caller.
+
+### updateEnemyStates(step, others[], otherAfter[])
+
+Updates `PodBase others[]` after simulation step. For collided/modified pods: saves `SimpleStateCoords enemyPositionBeforeMove`, writes new position+velocity with friction, checks checkpoint crossing via `getNextCpIdIfIntersects(enemyPositionBeforeMove, otherAfter, ...)`. For unmodified: copies from `otherPredictions[step+1]`.
+
+### rollout(simState, fromStep, simNextCpId&, arrivalFrame&, others[])
+
+Greedy continuation: aims at current checkpoint, uses `angleDependentThrust`, calls `simCandidate` for remaining steps.
+
+---
+
+## Pod Methods — Scoring
+
+### collisionBonus(simPod)
+
+Shield collision: +18000 (racer) / +35000 (blocker). Boost collision with lead enemy (blocker): +12500. Teammate collision: -(25000 + 15000 * currentLap).
+
+### approachScore(simPod, tx, ty, speedWeight)
+
+`-dist * distNormCoeff + speedToward * speedWeight`. `distNormCoeff = (avgDist/18000)²` prevents distance from dominating on large tracks.
+
+### evaluateScore(simPod, arrivalFrame, currentCp, nextCp)
+
+If checkpoint passed: `cpsPassed * 25000 + (SIM_DEPTH - arrivalFrame) * 5000 - distToNextCP * 5.0 + bonus`.
+If not passed, racer: `approachScore(currentCp, weight=3.0) + bonus`.
+If not passed, blocker with urgency: `max(raceScore, interceptScore) + bonus` where interceptScore uses `minEnemyDistSq`.
+If not passed, blocker without urgency: `raceScore + interceptScore(enemyCp, weight=15.0) * 0.25 + bonus`.
+
+---
+
+## Pod Methods — Search
+
+### searchForBestThrust(initial, dirToCp, currentCp, nextCp, thrusts[], ...)
+
+Step 0 search loop. For each angle × thrust combination: creates fresh `PodBase enemies0[3]`, calls `simCandidate` for step 0, then `searchFromStep1` for deeper search. Tracks best scores for normal/boost/shield separately.
+
+### searchFromStep1(afterStep0, simCpId0, arrival0, currentCp, nextCp, enemies0[])
+
+Steps 1-2 nested loops. For each angle × thrust at step 1: `simCandidate`, then for each angle × thrust at step 2: `simCandidate` + `rollout` for step 3. Returns best score across all step 1-2-3 combinations.
+
+### selectBestAction(canBoost, canShield, scores...)
+
+Picks best action: boost if score > normal + 10000, shield if score > normal + 0, otherwise normal thrust.
+
+### findBestMove()
+
+Entry point. Calls `precomputeOthers`, determines aim direction (early CP switch for racer, enemy CP for blocker with urgency), builds thrust options (adding boost/shield if eligible), calls `searchForBestThrust`, calls `selectBestAction`.
+
+---
+
+## Pod Methods — Roles & Setup
+
+### assignRoles(a, b)
+
+Pod further ahead (by `totalCpsPassed`, then `distSqToNextCp`) = racer. Other = blocker.
+
+### calcInterceptUrgency(a, b, enemyCps[], ...)
+
+Counts enemies ahead. Triggers: enemy ahead by CPs, ahead by distance (> 2000 closer), or blocker path crosses enemy CP (`segmentIntersectsCircle`). Urgency = `enemiesAhead * 0.51`.
+
+### findLeadOpponent(podX[], podY[], podCpId[], enemyCps[])
+
+Returns index (2 or 3) of leading enemy by `enemyCpsPassed`, then distance to next CP.
+
+### setupLeadEnemy(pods[], leadOp, podX[], podY[], podCpId[])
+
+Sets `leadEnemyX/Y/NextCpId/Idx` on both pods from `podX/Y/CpId[leadOp]`.
+
+### setupOtherPods(pods[], podX[], podY[], podVx[], podVy[], podAngle[], podCpId[])
+
+Creates `PodBase others[3]` (teammate + 2 enemies) for each pod via aggregate initialization.
+
+### setupTurn(pods[], podX[], ...)
+
+Orchestrates per-turn setup: `assignRoles` → `findLeadOpponent` → `calcInterceptUrgency` → `setupLeadEnemy` → `setupOtherPods`.
+
+---
+
+## Pod Methods — Output
+
+### receiveTeammateMove(teammate)
+
+Extracts teammate's chosen angle, thrust, facing for `precomputeOthers` step 0 prediction.
+
+### navigate()
+
+Decrements shield cooldown. Low-thrust override: if thrust < 20 for > 4 frames → force 100 for 4 frames. Outputs `targetX targetY BOOST|SHIELD|thrust message`.
 
 ---
 
 ## Main Loop
 
-**Initialization:** read laps, checkpoints, `computeDistNormCoeff()`, create `pods[2]`.
-
-**Per frame:**
-1. Read 4 pod states, track enemy cpsPassed
-2. `setState()` for own pods (converts angle deg->rad, tracks laps)
-3. `assignRoles()` — racer/blocker by CP progress
-4. `findLeadOpponent()` — leading enemy by CP progress
-5. `calcInterceptUrgency()` — urgency from enemy lead + path crossing
-6. Set others: teammate (index 0) + 2 opponents (indices 1-2)
-7. pod[0]: `findBestMove()` (no teammate info)
-8. pod[1]: `receiveTeammateMove(pod[0])` then `findBestMove()`
-9. Track scores in `scoreHistory`
-10. Both pods: `navigate()`
-11. Near finish: output total scores to stderr
-
----
-
-## Key Design Decisions
-
-- **All angles in radians**: eliminates deg/rad conversions in the hot simulation loop.
-- **Quadratic distance normalization**: `distNormCoeff = (avgDist/18000)²` prevents `-dist` from dominating scoring on large tracks. On small tracks coeff is tiny (~0.03), on large tracks moderate (~0.25).
-- **max(raceScore, interceptScore)**: blocker commits fully to whichever direction is better. No weighted blending — that caused paralysis (thrust=0 as "compromise").
-- **Path-crossing intercept**: `segmentIntersectsCircle` detects when blocker's race path passes near enemy's CP. Enables "free" interceptions without sacrificing race performance. Game-changer improvement.
-- **Intercept speed weight 10.0 vs race 3.0**: blocker values speed toward enemy CP more than racer values speed toward own CP, making intercept trajectories competitive in `max()`.
-- **Teammate-aware**: shield checks skip teammate. Teammate collision penalty scales with lap (25k + 15k * lap). Boost collision bonus only for hitting lead enemy.
-- **Sequential pod computation**: pod[0] decides first, pod[1] gets pod[0]'s actual move for better prediction.
-- **No boost on lap 1**: prevents early misfires when positions are suboptimal.
+1. Read laps, checkpoints, `computeDistNormCoeff()`, create `pods[2]`
+2. Per turn:
+   - Read 4 pod states, track enemy `cpsPassed`
+   - `setState()` for own pods (deg→rad, lap tracking)
+   - `Pod::setupTurn()` — roles, intercept urgency, lead enemy, other pods
+   - Racer: `findBestMove()` (no teammate info)
+   - Blocker: `receiveTeammateMove(racer)` then `findBestMove()`
+   - `chrono` timing: `T{turn} R={μs} B={μs}` to stderr
+   - Both pods: `navigate()`
+   - Near finish: output total scores to stderr

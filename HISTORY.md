@@ -357,9 +357,106 @@ Added static field `Pod::currentTurn` — used for `BOOST_MIN_TURN` check.
 
 ---
 
+## Step 21: Major Refactoring — Structure Hierarchy & Performance
+
+### Type hierarchy refactoring
+
+Introduced layered struct hierarchy to separate concerns and reduce hot-path overhead:
+
+- **`SimpleStateCoords`** `{double x, y}` — minimal position. Used as base for all state types and for local pre-move snapshots.
+- **`SimpleStateSpeeds`** `{double vx, vy}` — minimal velocity.
+- **`PodBaseState : SimpleStateCoords, SimpleStateSpeeds`** `{bool modified}` — lightweight move data for `othersAfterMove` and `othersFinal` in collision simulation. No prev-tracking, no facingAngle. 5 fields total.
+- **`PodBase : SimpleStateCoords, SimpleStateSpeeds`** `{facingAngle, nextCpId, modified, static boostHoldTurns, static currentTurn}` + update/get methods — used for enemy tracking in search (`enemies0/1/2[]`). ~56 bytes. No prev-tracking.
+- **`SimState : PodBase`** `{prevX, prevY, cpsPassed, shieldTurnsLeft, shieldCollided, boostCollided, teammateCollided, minEnemyDistSq}` + `updateX/Y` with prev-saving, `setAfterCollisionX/Y` without prev-saving, `getPrevX/Y` — used only for the simulated pod (our pod). ~80 bytes.
+- **`Pod : PodBase`** — full game-time pod with persistent state, search, navigation.
+
+Key principle: heavier types only where needed. Enemies use `PodBase` (~56 bytes) instead of `SimState` (~80 bytes). Move data uses `PodBaseState` (~40 bytes) instead of `SimState`.
+
+### applyMutualCollision refactored
+
+Now takes `SimState&` for our pod and `PodBaseState&` for enemy. Direct field access on enemy (`.x`, `.vx`) instead of getters. Overlap correction uses `setAfterCollisionX/Y` on our pod (preserves prevX for checkpoint detection) and direct writes on enemy.
+
+### computeEnemyMoves uses PodBaseState
+
+`othersAfterMove[]` changed from `SimState[]` to `PodBaseState[]`. Direct field writes instead of `updateX/updateVx` calls. No constructor overhead.
+
+### slowPath uses PodBaseState
+
+`othersFinal[]` and `enemyAtCollision` changed from `SimState` to `PodBaseState`. Direct field access throughout.
+
+### findCollisionTime accepts SimpleStateCoords
+
+Signature changed from 8 doubles to 4 `SimpleStateCoords` references + radius. Cleaner interface, same computation.
+
+### getNextCpIdIfIntersects accepts SimpleStateCoords
+
+Takes `SimpleStateCoords& from`, `SimpleStateCoords& to`, `Point& circle` instead of 7 doubles. Enemy checkpoint detection uses local `SimpleStateCoords enemyPositionBeforeMove` snapshot.
+
+### Checkpoint detection: prevX/prevY only in SimState
+
+`PodBase` (used for enemies) has no prev-tracking. Enemy checkpoint detection in `updateEnemyStates` saves position in local `SimpleStateCoords` before update. Our pod's checkpoint detection in `fastPath`/`slowPath` uses `SimState::getPrevX()/getPrevY()`.
+
+### simCandidate optimized
+
+`computeEnemyMoves` called once, result used for both collision check and slowPath. No double `applyRotationAndThrust` for modified enemies. Collision check loop uses `othersAfterMove` data directly.
+
+### SimState slimmed
+
+Removed `prevVx, prevVy, prevFacingAngle` — never read anywhere. Saves 24 bytes per SimState copy. `updateVx/Vy/FacingAngle` are simple writes without prev-saving.
+
+### simNextCpId and arrivalFrame by reference
+
+Fixed critical bug: refactoring changed `int&` to `int` in `simCandidate`, `fastPath`, `slowPath` signatures. Checkpoint progress and arrival frame were lost — scoring couldn't distinguish moves that pass checkpoints from those that don't. Restored `int&`.
+
+### shieldCooldown in initial SimState
+
+Fixed: `findBestMove` was passing `false` (0) as shieldCooldown to initial SimState constructor. Now passes actual `Pod::shieldCooldown` value.
+
+### canShield simplified
+
+Shield search candidates always included when `shieldCooldown == 0`. Distance/speed gates removed — let simulation decide. Previous gates were too tight for high-speed approaches.
+
+### Turn order: racer first
+
+Racer always computes first (gets priority). Blocker computes second with racer's actual move via `receiveTeammateMove`. Previously was always pod[0] first.
+
+### Boost hold turns
+
+`boostHoldTurns` countdown replaces `currentTurn >= BOOST_MIN_TURN` check. Initialized to `BOOST_MIN_TURN`, decremented each turn. Reset to `BOOST_MIN_TURN / 2` after boost use.
+
+### Timing instrumentation
+
+Added `chrono::steady_clock` timing for racer (R) and blocker (B) per turn, printed to stderr as `T{turn} R={μs} B={μs}`.
+
+### Bug fixes during refactoring
+
+1. `applyMutualCollision`: enemy velocity used `simState.getVx()` instead of `enemyState.getVx()`
+2. `slowPath`: `updateVx` called twice instead of `updateVx`+`updateVy` (friction)
+3. `SimState` constructor: `prevVy(y)` instead of `prevVy(vy)`
+4. `evaluateScore`: `enemyCp.x, enemyCp.x` instead of `enemyCp.x, enemyCp.y`
+5. `fastPath` checkpoint detection: segment was zero-length (same point twice)
+6. `updateEnemyStates` checkpoint detection: used already-updated position instead of pre-move
+7. `slowPath` enemy remaining movement: started from pre-collision position instead of collision point
+8. `setupLeadEnemy`: accessed `pods[leadOp]` where leadOp=2/3 on size-2 array (out of bounds)
+9. `slowPath` received `others` instead of `othersAfterMove` for physics calculations
+10. `predictPodStep` applied teammate move to all steps instead of only step 0
+11. `computeEnemyMoves` didn't propagate `facingAngle` to `others` for modified enemies
+12. `SimState` default constructor: `modified` field uninitialized — caused false modified flags, forced slow path
+13. `update*` methods took `int` instead of `double` — truncated all intermediate values
+
+### Performance results
+
+- Enemy arrays: `PodBase` ~56 bytes (was `SimState` ~104 bytes). 100K constructions per turn.
+- Move data: `PodBaseState` ~40 bytes (was `SimState` ~104 bytes). Created per slow path call.
+- SimState: ~80 bytes (was ~104 bytes). Copied 56K times per search.
+- Total overhead vs original reduced from ~7ms to ~2-3ms.
+
+---
+
 ## TODO
 
 - **Blocker friendly-fire penalty**: penalize blocker hitting an enemy when teammate (racer) is behind the enemy along the impact direction. The hit sends the enemy into our racer.
 - **Shield activation**: simulation can't detect unavoidable collisions because enemy prediction moves enemy away. Need better near-collision enemy prediction or alternative shield decision mechanism.
 - **Next-CP speed scoring**: reward velocity toward next CP when passing current CP, to reduce overshooting on sharp turns.
 - **M_PI removal**: tested, caused regression. M_PI critical for post-collision recovery. Do not remove.
+- **Further performance**: slow path still ~0.8μs per call. 56K slow paths = ~45ms. When both pods have heavy slow paths, total approaches 150ms limit. Consider: reduced search space for blocker, time-based early termination, or further struct slimming.

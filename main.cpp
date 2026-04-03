@@ -1,14 +1,15 @@
 #include <iostream>
 #include <vector>
 #include <cmath>
+#include <numeric>
+#include <chrono>
 
 using namespace std;
 
 // ===== Constants =====
-
 // Physics
 constexpr double FRICTION = 0.85;
-constexpr double CP_RADIUS = 595.0;
+constexpr double CP_RADIUS = 585.0;
 constexpr double CP_RADIUS_REDUCTION = 5.0;
 constexpr double COLLISION_RADIUS = 800.0;
 constexpr double MIN_COLLISION_IMPULSE = 120.0;
@@ -26,7 +27,8 @@ constexpr int LOW_THRUST_OVERRIDE = 100;
 constexpr double TARGET_POINT_DIST = 10000.0;
 
 // Scoring
-constexpr double SCORE_CP_PASSED = 50000.0;
+constexpr double SCORE_CP_PASSED = 25000.0;
+
 constexpr double SCORE_EARLY_ARRIVAL = 5000.0;
 constexpr double SCORE_SPEED_WEIGHT_FINAL = 0.025;
 constexpr double SCORE_SPEED_TOWARD_NORMAL = 3.0;
@@ -34,7 +36,7 @@ constexpr double SCORE_SPEED_TOWARD_FINAL = 15.0;
 constexpr double SCORE_DIST_TO_NEXT_WEIGHT = 5.0;
 
 // Boost
-constexpr int BOOST_MIN_DIST = 3500;
+constexpr int BOOST_MIN_DIST = 4500;
 constexpr int BOOST_MIN_LAP = 1;
 constexpr int BOOST_MIN_TURN = 10;
 constexpr double BOOST_SCORE_THRESHOLD = 10000.0;
@@ -50,19 +52,20 @@ constexpr double SHIELD_COLLISION_BONUS = 18000.0;
 constexpr double SHIELD_COLLISION_BONUS_BLOCKER = 35000.0;
 constexpr double SHIELD_MIN_REL_SPEED_SQ = 125000.0;
 constexpr double BOOST_COLLISION_BONUS_BLOCKER = 12500.0;
+// need bonus for hitting leader
 constexpr double TEAMMATE_COLLISION_PENALTY = 25000.0;
 constexpr double TEAMMATE_COLLISION_PENALTY_PER_LAP = 15000.0;
 constexpr double INTERCEPT_URGENCY_PER_ENEMY = 0.51;
 constexpr double INTERCEPT_DIST_THRESHOLD = 2000.0;
 constexpr double INTERCEPT_PATH_RADIUS = 2000.0;
-constexpr double BLOCKER_PASSIVE_INTERCEPT_WEIGHT = 0.2;
+constexpr double BLOCKER_PASSIVE_INTERCEPT_WEIGHT = 0.25;
 constexpr double INTERCEPT_PROXIMITY_BONUS = 15000.0;
 constexpr double INTERCEPT_PROXIMITY_WEIGHT = 1.0;
 
 // Search: step 0
 constexpr double ANGLE_OFFSETS_1[] = {
-    -60*DEG_TO_RAD, -27*DEG_TO_RAD, -15*DEG_TO_RAD, -7*DEG_TO_RAD, 0,
-    7*DEG_TO_RAD, 15*DEG_TO_RAD, 27*DEG_TO_RAD, 60*DEG_TO_RAD, M_PI
+    -27*DEG_TO_RAD, -15*DEG_TO_RAD, -7*DEG_TO_RAD, 0,
+    7*DEG_TO_RAD, 15*DEG_TO_RAD, 27*DEG_TO_RAD, M_PI
 };
 constexpr int THRUST_OPTIONS_1[] = {10, 42, 75, 100, 0};
 constexpr int ANGLE_COUNT_1 = sizeof(ANGLE_OFFSETS_1) / sizeof(ANGLE_OFFSETS_1[0]);
@@ -75,6 +78,12 @@ constexpr double ANGLE_OFFSETS_23[] = {
 constexpr int THRUST_OPTIONS_23[] = {10, 42, 75, 100};
 constexpr int ANGLE_COUNT_23 = sizeof(ANGLE_OFFSETS_23) / sizeof(ANGLE_OFFSETS_23[0]);
 constexpr int THRUST_COUNT_23 = sizeof(THRUST_OPTIONS_23) / sizeof(THRUST_OPTIONS_23[0]);
+
+enum OtherPodIndex {
+    TEAMMATE = 0,
+    ENEMY_FIRST = 1,
+    ENEMY_SECOND = 2
+};
 
 // ===== Global game state =====
 
@@ -97,6 +106,17 @@ struct Point {
     }
 };
 
+struct SimpleStateCoords {
+    double x, y;
+};
+struct SimpleStateSpeeds {
+    double vx, vy;
+};
+
+struct PodBaseState : SimpleStateCoords, SimpleStateSpeeds {
+    bool modified = false;
+};
+
 Point checkpoints[20];
 double distNormCoeff = 1.0;
 
@@ -116,29 +136,10 @@ double normalizeAngle(double angle) {
     return angle;
 }
 
-double findCollisionTime(double ax0, double ay0, double ax1, double ay1,
-                         double bx0, double by0, double bx1, double by1,
-                         double radius) {
-    double rx = ax0 - bx0, ry = ay0 - by0;
-    double drx = (ax1 - ax0) - (bx1 - bx0);
-    double dry = (ay1 - ay0) - (by1 - by0);
-    double a = drx*drx + dry*dry;
-    double b = 2*(rx*drx + ry*dry);
-    double c = rx*rx + ry*ry - radius*radius;
-    if (c <= 0) return 0;
-    if (a < 1e-9) return -1;
-    double disc = b*b - 4*a*c;
-    if (disc < 0) return -1;
-    double sqrtD = sqrt(disc);
-    double t = (-b - sqrtD) / (2*a);
-    if (t >= 0 && t <= 1) return t;
-    return -1;
-}
-
 bool segmentIntersectsCircle(double x1, double y1, double x2, double y2,
-                              double px, double py, double radius) {
+                              double circleX, double circleY, double radius) {
     double dx = x2 - x1, dy = y2 - y1;
-    double fx = x1 - px, fy = y1 - py;
+    double fx = x1 - circleX, fy = y1 - circleY;
     double a = dx*dx + dy*dy;
     if (a < 1e-9) return (fx*fx + fy*fy <= radius*radius);
     double b = 2*(fx*dx + fy*dy);
@@ -151,8 +152,33 @@ bool segmentIntersectsCircle(double x1, double y1, double x2, double y2,
     return (t1 >= 0 && t1 <= 1) || (t2 >= 0 && t2 <= 1) || (t1 < 0 && t2 > 1);
 }
 
-struct SimState {
-    double x, y, vx, vy, facingAngle; // facingAngle in radians
+struct PodBase : SimpleStateCoords, SimpleStateSpeeds {
+    static int boostHoldTurns;
+    static int currentTurn;
+
+    double facingAngle;
+    int nextCpId;
+    bool modified = false;
+
+    void updateX(double _x) { x = _x; }
+    void updateY(double _y) { y = _y; }
+    void updateVx(double _vx) { vx = _vx; }
+    void updateVy(double _vy) { vy = _vy; }
+    void updateFacingAngle(double _fa) { facingAngle = _fa; }
+
+    double getX() const { return x; }
+    double getY() const { return y; }
+    double getVx() const { return vx; }
+    double getVy() const { return vy; }
+    double getFacingAngle() const { return facingAngle; }
+
+    double distTo(double tx, double ty) const { double dx = tx - x, dy = ty - y; return sqrt(dx*dx + dy*dy); }
+    double sqDistTo(double tx, double ty) const { double dx = tx - x, dy = ty - y; return dx*dx + dy*dy; }
+    double angleTo(double tx, double ty) const { return atan2(ty - y, tx - x); }
+};
+
+struct SimState : PodBase {
+    double prevX, prevY;
     int cpsPassed;
     int shieldTurnsLeft;
     bool shieldCollided;
@@ -160,30 +186,36 @@ struct SimState {
     bool teammateCollided;
     double minEnemyDistSq;
 
-    double distTo(double px, double py) const {
-        double dx = px - x, dy = py - y;
-        return sqrt(dx*dx + dy*dy);
-    }
+    void updateX(double _x) { prevX = x; x = _x; }
+    void updateY(double _y) { prevY = y; y = _y; }
+    void setAfterCollisionX(double _x) { x = _x; }
+    void setAfterCollisionY(double _y) { y = _y; }
+    double getPrevX() const { return prevX; }
+    double getPrevY() const { return prevY; }
 
-    double angleTo(double px, double py) const {
-        return atan2(py - y, px - x);
+    SimState() : PodBase(), prevX(0), prevY(0), cpsPassed(0), shieldTurnsLeft(0),
+                 shieldCollided(false), boostCollided(false), teammateCollided(false),
+                 minEnemyDistSq(1e18) {}
+
+    SimState(double x, double y, double vx, double vy, double facingAngle, int cpsPassed, int shieldCooldown,
+             bool shieldCollided, bool boostCollided, bool teammateCollided, double minEnemyDistSq, int nextCpId=0) :
+    prevX(x), prevY(y), cpsPassed(cpsPassed), shieldTurnsLeft(shieldCooldown),
+    shieldCollided(shieldCollided), boostCollided(boostCollided),
+    teammateCollided(teammateCollided), minEnemyDistSq(minEnemyDistSq)
+    {
+        this->x = x; this->y = y; this->vx = vx; this->vy = vy;
+        this->facingAngle = facingAngle;
+        this->nextCpId = nextCpId; this->modified = false;
     }
 };
 
-struct EnemyStepState {
-    double x, y, vx, vy;
-    double facingAngle;
-    int nextCpId;
-    bool modified;
-};
-
-struct Pod {
+struct Pod : PodBase {
     Pod() : shieldCooldown(0), lowThrustFrames(0), overrideFramesLeft(0),
             boostAvailable(true), currentLap(1), totalCpsPassed(0), prevNextCpId(-1) {}
 
     // Current state (from input)
-    double x, y, vx, vy;
-    double facingAngle; // radians
+    double x, y, vx, vy, prevX, prevY, prevVx, prevVy;
+    double facingAngle, prevFacingAngle; // radians
     int nextCpId;
 
     // Persistent state
@@ -207,17 +239,11 @@ struct Pod {
     int thrust;
     double chosenScore;
     int podIndex = 0;
-    static int currentTurn;
     vector<int> scoreHistory = vector<int>(500);
 
     // Other pods for collision prediction
     static constexpr int MAX_OTHERS = 3;
-    struct OtherPodState {
-        double x, y, vx, vy;
-        double facingAngle;
-        int nextCpId;
-    };
-    OtherPodState others[MAX_OTHERS];
+    PodBase others[MAX_OTHERS];
     int otherCount;
 
     struct PodPrediction {
@@ -228,9 +254,9 @@ struct Pod {
     };
     PodPrediction otherPredictions[MAX_OTHERS][SIM_DEPTH + 1];
 
-    void setState(int px, int py, int pvx, int pvy, int angleDeg, int cpId) {
-        x = px; y = py;
-        vx = pvx; vy = pvy;
+    void setState(int podX, int podY, int podVx, int podVy, int angleDeg, int cpId) {
+        x = podX; y = podY;
+        vx = podVx; vy = podVy;
         facingAngle = angleDeg * DEG_TO_RAD;
         nextCpId = cpId;
         targetPosition = checkpoints[cpId];
@@ -242,7 +268,7 @@ struct Pod {
         prevNextCpId = cpId;
     }
 
-    void setOthers(const OtherPodState* o, int count) {
+    void setOthers(const PodBase* o, int count) {
         otherCount = count;
         for (int i = 0; i < count; i++) others[i] = o[i];
     }
@@ -267,122 +293,125 @@ struct Pod {
 
     // ===== Simulation methods =====
 
-    SimState applyRotationAndThrust(SimState s, double targetAngle, int simThrust) const {
-        double diff = normalizeAngle(targetAngle - s.facingAngle);
+    void applyRotationAndThrust(PodBase& podState, double targetAngle, int simThrust) const {
+        double diff = normalizeAngle(targetAngle - podState.getFacingAngle());
         if (diff > MAX_TURN) diff = MAX_TURN;
         if (diff < -MAX_TURN) diff = -MAX_TURN;
-        s.facingAngle += diff;
-        double cosAngle = cos(s.facingAngle);
-        double sinAngle = sin(s.facingAngle);
-        s.vx += simThrust * cosAngle;
-        s.vy += simThrust * sinAngle;
-        return s;
+        podState.updateFacingAngle(podState.getFacingAngle() + diff);
+        double cosAngle = cos(podState.getFacingAngle());
+        double sinAngle = sin(podState.getFacingAngle());
+        podState.updateVx(podState.getVx() + simThrust * cosAngle);
+        podState.updateVy(podState.getVy() + simThrust * sinAngle);
+    }
+    
+
+    static double findCollisionTime(const SimpleStateCoords& startA, const SimpleStateCoords& endA,
+                                    const SimpleStateCoords& startB, const SimpleStateCoords& endB,
+                                    double radius) {
+        double rx = startA.x - startB.x, ry = startA.y - startB.y;
+        double drx = (endA.x - startA.x) - (endB.x - startB.x);
+        double dry = (endA.y - startA.y) - (endB.y - startB.y);
+        double quadA = drx*drx + dry*dry;
+        double quadB = 2*(rx*drx + ry*dry);
+        double quadC = rx*rx + ry*ry - radius*radius;
+        if (quadC <= 0) return 0;
+        if (quadA < 1e-9) return -1;
+        double discriminant = quadB*quadB - 4*quadA*quadC;
+        if (discriminant < 0) return -1;
+        double sqrtDiscriminant = sqrt(discriminant);
+        double collisionTime = (-quadB - sqrtDiscriminant) / (2*quadA);
+        if (collisionTime >= 0 && collisionTime <= 1) return collisionTime;
+        return -1;
     }
 
-    SimState simStep(SimState s, double targetAngle, int simThrust) const {
-        s = applyRotationAndThrust(s, targetAngle, simThrust);
-        s.x += s.vx;
-        s.y += s.vy;
-        s.vx = (int)(s.vx * FRICTION);
-        s.vy = (int)(s.vy * FRICTION);
-        s.x = (int)s.x;
-        s.y = (int)s.y;
-        return s;
-    }
 
-    void precomputeOthers() {
-        for (int p = 0; p < otherCount; p++) {
-            double ox = others[p].x, oy = others[p].y;
-            double ovx = others[p].vx, ovy = others[p].vy;
-            double facing = others[p].facingAngle;
-            int cpId = others[p].nextCpId;
-
-            int startStep = 0;
-
-            if (p == 0 && hasTeammateMove) {
-                SimState ts = {ox, oy, ovx, ovy, teammateFacing, 0, 0, false, false, false, 1e18};
-                ts = applyRotationAndThrust(ts, teammateAngle, teammateThrust);
-                otherPredictions[p][0] = {ox, oy, ovx, ovy, ts.vx, ts.vy, ts.facingAngle, cpId};
-
-                double prevX = ox, prevY = oy;
-                ox = (int)(ox + ts.vx);
-                oy = (int)(oy + ts.vy);
-                ovx = (int)(ts.vx * FRICTION);
-                ovy = (int)(ts.vy * FRICTION);
-                facing = ts.facingAngle;
-
-                if (segmentIntersectsCircle(prevX, prevY, ox, oy,
-                                            checkpoints[cpId].x, checkpoints[cpId].y, CP_RADIUS)) {
-                    cpId = (cpId + 1) % checkpointCount;
-                }
-                startStep = 1;
-            }
-
-            for (int i = startStep; i < SIM_DEPTH; i++) {
-                Point target = checkpoints[cpId];
-                double aimAngle = atan2(target.y - oy, target.x - ox);
-                int rollThrust = angleDependentThrust(aimAngle, facing);
-
-                SimState ts = {ox, oy, ovx, ovy, facing, 0, 0, false, false, false, 1e18};
-                ts = applyRotationAndThrust(ts, aimAngle, rollThrust);
-                otherPredictions[p][i] = {ox, oy, ovx, ovy, ts.vx, ts.vy, ts.facingAngle, cpId};
-
-                double prevX = ox, prevY = oy;
-                ox = (int)(ox + ts.vx);
-                oy = (int)(oy + ts.vy);
-                ovx = (int)(ts.vx * FRICTION);
-                ovy = (int)(ts.vy * FRICTION);
-                facing = ts.facingAngle;
-
-                if (segmentIntersectsCircle(prevX, prevY, ox, oy,
-                                            target.x, target.y, CP_RADIUS)) {
-                    cpId = (cpId + 1) % checkpointCount;
-                }
-            }
-
-            otherPredictions[p][SIM_DEPTH] = {ox, oy, ovx, ovy, 0, 0, facing, cpId};
+    int getNextCpIdIfIntersects(const SimpleStateCoords& from, const SimpleStateCoords& to,
+                              const Point& circle, double radius, int nextCpId) {
+        if (segmentIntersectsCircle(from.x, from.y, to.x, to.y, circle.x, circle.y, CP_RADIUS)) {
+            return (nextCpId + 1) % checkpointCount;
+        } else {
+            return nextCpId;
         }
     }
 
-    bool applyMutualCollision(SimState& s, double& ox, double& oy,
-                              double& ovx, double& ovy,
+    void predictPodStep(PodBase& state, const Point& target, int podIdx, int step) {
+
+        double aimAngle = atan2(target.y - state.getY(), target.x - state.getX());
+        int rollThrust = angleDependentThrust(aimAngle, state.getFacingAngle());
+        double facingAngle = state.getFacingAngle();
+        if (podIdx == TEAMMATE && hasTeammateMove && step == 0) {
+            aimAngle = teammateAngle;
+            rollThrust = teammateThrust;
+            facingAngle = teammateFacing;
+        }
+
+        PodBase tempState = {state.getX(), state.getY(), state.getVx(), state.getVy(), facingAngle};
+        applyRotationAndThrust(tempState, aimAngle, rollThrust);
+        otherPredictions[podIdx][step] = {state.getX(), state.getY(), state.getVx(), state.getVy(),
+                                          tempState.vx, tempState.vy, tempState.facingAngle, state.nextCpId};
+
+        SimpleStateCoords positionBeforeMove = {state.x, state.y};
+        state.updateX((int)(state.getX() + tempState.vx));
+        state.updateY((int)(state.getY() + tempState.vy));
+        state.updateVx((int)(tempState.vx * FRICTION));
+        state.updateVy((int)(tempState.vy * FRICTION));
+        state.updateFacingAngle(tempState.facingAngle);
+
+        state.nextCpId = getNextCpIdIfIntersects(positionBeforeMove, state, target, CP_RADIUS, state.nextCpId);
+    }
+
+    void precomputeOthers() {
+        for (int pId = 0; pId < otherCount; pId++) {
+            PodBase state = others[pId];
+            int startStep = 0;
+
+            for (int i = 0; i < SIM_DEPTH; i++) {
+                predictPodStep(state, checkpoints[state.nextCpId], pId, i);
+            }
+
+            otherPredictions[pId][SIM_DEPTH] = {state.getX(), state.getY(), state.getVx(), state.getVy(),
+                                               0, 0, state.getFacingAngle(), state.nextCpId};
+        }
+    }
+
+    bool applyMutualCollision(SimState& simState, PodBaseState& enemy,
                               double myMass, double otherMass) {
-        double dx = s.x - ox;
-        double dy = s.y - oy;
+        double dx = simState.getX() - enemy.x;
+        double dy = simState.getY() - enemy.y;
         double distSq = dx*dx + dy*dy;
         if (distSq >= COLLISION_RADIUS * COLLISION_RADIUS || distSq < 1e-9) return false;
         double dist = sqrt(distSq);
         double nx = dx / dist;
         double ny = dy / dist;
-        double dvx = s.vx - ovx;
-        double dvy = s.vy - ovy;
+        double dvx = simState.getVx() - enemy.vx;
+        double dvy = simState.getVy() - enemy.vy;
         double dvn = dvx * nx + dvy * ny;
         if (dvn > 0) return false;
         double totalMass = myMass + otherMass;
         double impulse = max(MIN_COLLISION_IMPULSE, -2.0 * myMass * otherMass * dvn / totalMass);
-        s.vx += (impulse / myMass) * nx;
-        s.vy += (impulse / myMass) * ny;
-        ovx -= (impulse / otherMass) * nx;
-        ovy -= (impulse / otherMass) * ny;
+        simState.updateVx(simState.getVx() + (impulse / myMass) * nx);
+        simState.updateVy(simState.getVy() + (impulse / myMass) * ny);
+        enemy.vx -= (impulse / otherMass) * nx;
+        enemy.vy -= (impulse / otherMass) * ny;
         double overlap = COLLISION_RADIUS - dist;
         if (overlap > 0) {
             double pushUs = otherMass / totalMass;
             double pushThem = myMass / totalMass;
-            s.x += overlap * nx * pushUs;
-            s.y += overlap * ny * pushUs;
-            ox -= overlap * nx * pushThem;
-            oy -= overlap * ny * pushThem;
+            simState.setAfterCollisionX(simState.getX() + overlap * nx * pushUs);
+            simState.setAfterCollisionY(simState.getY() + overlap * ny * pushUs);
+            enemy.x -= overlap * nx * pushThem;
+            enemy.y -= overlap * ny * pushThem;
         }
         return true;
     }
 
-    int resolveThrust(int simThrust, SimState& s) const {
+    int resolveThrust(int simThrust, SimState& simState) const {
         if (simThrust == SHIELD_THRUST_VALUE) {
-            s.shieldTurnsLeft = SHIELD_COOLDOWN;
+            simState.shieldTurnsLeft = SHIELD_COOLDOWN;
             return 0;
         }
-        if (s.shieldTurnsLeft > 0) {
-            s.shieldTurnsLeft--;
+        if (simState.shieldTurnsLeft > 0) {
+            simState.shieldTurnsLeft--;
             return 0;
         }
         return simThrust;
@@ -396,230 +425,233 @@ struct Pod {
         return max(20, (int)(100 - abs(normalizeAngle(aimAngle - facingAngle)) / DEG_TO_RAD));
     }
 
-    void computeEnemyMoves(int step, EnemyStepState enemies[MAX_OTHERS],
-                           double eStartX[], double eStartY[],
-                           double eMoveVx[], double eMoveVy[]) {
-        for (int p = 0; p < otherCount; p++) {
-            if (enemies[p].modified) {
-                eStartX[p] = enemies[p].x;
-                eStartY[p] = enemies[p].y;
-                Point target = checkpoints[enemies[p].nextCpId];
-                double eAim = atan2(target.y - enemies[p].y, target.x - enemies[p].x);
-                int eThrust = angleDependentThrust(eAim, enemies[p].facingAngle);
-                SimState es = {enemies[p].x, enemies[p].y, enemies[p].vx, enemies[p].vy,
-                              enemies[p].facingAngle, 0, 0, false, false, false, 1e18};
-                es = applyRotationAndThrust(es, eAim, eThrust);
-                eMoveVx[p] = es.vx;
-                eMoveVy[p] = es.vy;
-                enemies[p].facingAngle = es.facingAngle;
+    void computeEnemyMoves(int step, PodBase others[MAX_OTHERS],
+                           PodBaseState othersAfterMove[]) {
+        for (int podId = 0; podId < otherCount; ++podId) {
+            if (others[podId].modified) {
+                othersAfterMove[podId].x = others[podId].getX();
+                othersAfterMove[podId].y = others[podId].getY();
+                Point target = checkpoints[others[podId].nextCpId];
+                double eAim = atan2(target.y - others[podId].getY(), target.x - others[podId].getX());
+                int eThrust = angleDependentThrust(eAim, others[podId].getFacingAngle());
+                PodBase enemySimState = {others[podId].getX(), others[podId].getY(), others[podId].getVx(),
+                                        others[podId].getVy(), others[podId].getFacingAngle()};
+                applyRotationAndThrust(enemySimState, eAim, eThrust);
+                othersAfterMove[podId].vx = enemySimState.vx;
+                othersAfterMove[podId].vy = enemySimState.vy;
+                others[podId].updateFacingAngle(enemySimState.facingAngle);
             } else {
-                const auto& pred = otherPredictions[p][step];
-                eStartX[p] = pred.x;
-                eStartY[p] = pred.y;
-                eMoveVx[p] = pred.moveVx;
-                eMoveVy[p] = pred.moveVy;
+                const auto& pred = otherPredictions[podId][step];
+                othersAfterMove[podId].x = pred.x;
+                othersAfterMove[podId].y = pred.y;
+                othersAfterMove[podId].vx = pred.moveVx;
+                othersAfterMove[podId].vy = pred.moveVy;
             }
         }
     }
 
-    void setCollisionFlags(SimState& s, int p, double myMass, int simThrust) {
-        if (p == 0) {
-            s.teammateCollided = true;
+    void setCollisionFlags(SimState& simState, int p, double myMass, int simThrust) {
+        if (p == TEAMMATE) {
+            simState.teammateCollided = true;
         } else {
-            if (myMass > NORMAL_MASS) s.shieldCollided = true;
-            if (simThrust == 650 && p == leadEnemyIdx) s.boostCollided = true;
+            enemyCollisionDetected = true;
+            if (myMass > NORMAL_MASS) simState.shieldCollided = true;
+            if (simThrust == 650 && p == leadEnemyIdx) simState.boostCollided = true;
         }
     }
 
-    bool isAnyEnemyNear(const SimState& s, const EnemyStepState enemies[MAX_OTHERS]) const {
-        for (int p = 0; p < otherCount; p++) {
-            double dx = s.x - enemies[p].x, dy = s.y - enemies[p].y;
+    bool isAnyEnemyNear(const SimState& simState, const PodBase others[MAX_OTHERS]) const {
+        for (int podId = 0; podId < otherCount; ++podId) {
+            double dx = simState.getX() - others[podId].getX(), dy = simState.getY() - others[podId].getY();
             if (dx*dx + dy*dy < COLLISION_RADIUS * COLLISION_RADIUS) return true;
         }
         return false;
     }
 
-    void updateEnemyStates(int step, EnemyStepState enemies[MAX_OTHERS],
-                           const double eStartX[], const double eStartY[],
-                           const double eFinalX[], const double eFinalY[],
-                           const double eFinalVx[], const double eFinalVy[],
-                           const bool eCollided[]) {
-        for (int p = 0; p < otherCount; p++) {
-            if (eCollided[p] || enemies[p].modified) {
-                if (!enemies[p].modified && eCollided[p]) {
-                    enemies[p].facingAngle = otherPredictions[p][step].facingAfterStep;
-                    enemies[p].nextCpId = otherPredictions[p][step].nextCpId;
-                }
-                enemies[p].x = (int)eFinalX[p];
-                enemies[p].y = (int)eFinalY[p];
-                enemies[p].vx = (int)(eFinalVx[p] * FRICTION);
-                enemies[p].vy = (int)(eFinalVy[p] * FRICTION);
-                enemies[p].modified = true;
+    void updateEnemyStates(int step, PodBase others[MAX_OTHERS],
+                           const PodBaseState otherAfter[MAX_OTHERS]) {
 
-                Point eTarget = checkpoints[enemies[p].nextCpId];
-                if (segmentIntersectsCircle(eStartX[p], eStartY[p],
-                                            eFinalX[p], eFinalY[p],
-                                            eTarget.x, eTarget.y, CP_RADIUS)) {
-                    enemies[p].nextCpId = (enemies[p].nextCpId + 1) % checkpointCount;
+        for (int podId = 0; podId < otherCount; podId++) {
+            if (otherAfter[podId].modified || others[podId].modified) {
+                if (!others[podId].modified && otherAfter[podId].modified) {
+                    others[podId].updateFacingAngle(otherPredictions[podId][step].facingAfterStep);
+                    others[podId].nextCpId = otherPredictions[podId][step].nextCpId;
                 }
+                SimpleStateCoords enemyPositionBeforeMove = {others[podId].x, others[podId].y};
+                others[podId].updateX((int)otherAfter[podId].x);
+                others[podId].updateY((int)otherAfter[podId].y);
+                others[podId].updateVx((int)(otherAfter[podId].vx * FRICTION));
+                others[podId].updateVy((int)(otherAfter[podId].vy * FRICTION));
+                others[podId].modified = true;
+
+                Point enemyCheckpoint = checkpoints[others[podId].nextCpId];
+                others[podId].nextCpId = getNextCpIdIfIntersects(enemyPositionBeforeMove, otherAfter[podId],
+                                                                 enemyCheckpoint, CP_RADIUS, others[podId].nextCpId);
+                
             } else {
-                const auto& nextPred = otherPredictions[p][step + 1];
-                enemies[p].x = nextPred.x;
-                enemies[p].y = nextPred.y;
-                enemies[p].vx = nextPred.vx;
-                enemies[p].vy = nextPred.vy;
-                enemies[p].facingAngle = otherPredictions[p][step].facingAfterStep;
-                enemies[p].nextCpId = nextPred.nextCpId;
+                const auto& nextPred = otherPredictions[podId][step + 1];
+                others[podId].updateX( nextPred.x);
+                others[podId].updateY( nextPred.y);
+                others[podId].updateVx( nextPred.vx);
+                others[podId].updateVy( nextPred.vy);
+                others[podId].updateFacingAngle(otherPredictions[podId][step].facingAfterStep);
+                others[podId].nextCpId = nextPred.nextCpId;
             }
         }
     }
 
-    SimState simCandidate(SimState s, double aimAngle, int simThrust, int step,
-                          int& simNextCpId, int& arrivalFrame,
-                          EnemyStepState enemies[MAX_OTHERS]) {
-        double myMass = getMass(simThrust);
-        int actualThrust = resolveThrust(simThrust, s);
-        s = applyRotationAndThrust(s, aimAngle, actualThrust);
-        double startX = s.x, startY = s.y;
 
-        bool anyModified = enemies[0].modified || enemies[1].modified ||
-                           (otherCount > 2 && enemies[2].modified);
-
-        double eStartX[MAX_OTHERS], eStartY[MAX_OTHERS];
-        double eMoveVx[MAX_OTHERS], eMoveVy[MAX_OTHERS];
-        if (anyModified) {
-            computeEnemyMoves(step, enemies, eStartX, eStartY, eMoveVx, eMoveVy);
-        } else {
-            for (int p = 0; p < otherCount; p++) {
-                const auto& pred = otherPredictions[p][step];
-                eStartX[p] = pred.x; eStartY[p] = pred.y;
-                eMoveVx[p] = pred.moveVx; eMoveVy[p] = pred.moveVy;
-            }
-        }
-
-        // Find earliest segment collision
-        double firstT = 1.1;
-        int firstP = -1;
-        for (int p = 0; p < otherCount; p++) {
-            double t = findCollisionTime(startX, startY, startX + s.vx, startY + s.vy,
-                                         eStartX[p], eStartY[p],
-                                         eStartX[p] + eMoveVx[p], eStartY[p] + eMoveVy[p],
-                                         COLLISION_RADIUS);
-            if (t >= 0 && t < firstT) { firstT = t; firstP = p; }
-        }
-
-        // Fast path: no collision, no modified enemies
-        if (firstP < 0 && !anyModified) {
-            s.x = startX + s.vx;
-            s.y = startY + s.vy;
-            s.vx = (int)(s.vx * FRICTION);
-            s.vy = (int)(s.vy * FRICTION);
-            s.x = (int)s.x;
-            s.y = (int)s.y;
-
-            if (leadEnemyIdx >= 0) {
-                const auto& pred = otherPredictions[leadEnemyIdx][step + 1];
-                double edx = s.x - pred.x, edy = s.y - pred.y;
-                double enemyDistSq = edx*edx + edy*edy;
-                if (enemyDistSq < s.minEnemyDistSq) s.minEnemyDistSq = enemyDistSq;
-            }
-
-            bool anyNear = false;
-            for (int p = 0; p < otherCount; p++) {
-                const auto& np = otherPredictions[p][step + 1];
-                double dx = s.x - np.x, dy = s.y - np.y;
-                if (dx*dx + dy*dy < COLLISION_RADIUS * COLLISION_RADIUS) { anyNear = true; break; }
-            }
-            double cpRadius = anyNear ? CP_RADIUS - CP_RADIUS_REDUCTION : CP_RADIUS;
-            Point simTarget = checkpoints[simNextCpId];
-            if (segmentIntersectsCircle(startX, startY, s.x, s.y,
-                                         simTarget.x, simTarget.y, cpRadius)) {
-                s.cpsPassed++;
-                if (arrivalFrame < 0) arrivalFrame = step + 1;
-                simNextCpId = (simNextCpId + 1) % checkpointCount;
-            }
-            return s;
-        }
-
-        // Slow path: collision or modified enemies
-        double eFinalX[MAX_OTHERS], eFinalY[MAX_OTHERS];
-        double eFinalVx[MAX_OTHERS], eFinalVy[MAX_OTHERS];
-        bool eCollided[MAX_OTHERS] = {};
-        for (int p = 0; p < otherCount; p++) {
-            eFinalX[p] = eStartX[p] + eMoveVx[p];
-            eFinalY[p] = eStartY[p] + eMoveVy[p];
-            eFinalVx[p] = eMoveVx[p];
-            eFinalVy[p] = eMoveVy[p];
-        }
-
-        if (firstP >= 0) {
-            double t = firstT;
-            s.x = startX + t * s.vx;
-            s.y = startY + t * s.vy;
-            double eCollX = eStartX[firstP] + t * eMoveVx[firstP];
-            double eCollY = eStartY[firstP] + t * eMoveVy[firstP];
-            double postEVx = eMoveVx[firstP], postEVy = eMoveVy[firstP];
-            applyMutualCollision(s, eCollX, eCollY, postEVx, postEVy, myMass, NORMAL_MASS);
-            double remaining = 1.0 - t;
-            s.x += s.vx * remaining;
-            s.y += s.vy * remaining;
-            eFinalX[firstP] = eCollX + postEVx * remaining;
-            eFinalY[firstP] = eCollY + postEVy * remaining;
-            eFinalVx[firstP] = postEVx;
-            eFinalVy[firstP] = postEVy;
-            eCollided[firstP] = true;
-            setCollisionFlags(s, firstP, myMass, simThrust);
-        } else {
-            s.x = startX + s.vx;
-            s.y = startY + s.vy;
-        }
-
-        for (int p = 0; p < otherCount; p++) {
-            if (p == firstP) continue;
-            if (applyMutualCollision(s, eFinalX[p], eFinalY[p],
-                                      eFinalVx[p], eFinalVy[p], myMass, NORMAL_MASS)) {
-                eCollided[p] = true;
-                setCollisionFlags(s, p, myMass, simThrust);
-            }
-        }
-
-        updateEnemyStates(step, enemies, eStartX, eStartY,
-                          eFinalX, eFinalY, eFinalVx, eFinalVy, eCollided);
-
-        s.vx = (int)(s.vx * FRICTION);
-        s.vy = (int)(s.vy * FRICTION);
-        s.x = (int)s.x;
-        s.y = (int)s.y;
+    void fastPath(SimState& simState, int step, int& simNextCpId, int& arrivalFrame) {
+        fastPathCount++;
+        simState.updateX((int)(simState.getX() + simState.getVx()));
+        simState.updateY((int)(simState.getY() + simState.getVy()));
+        simState.updateVx((int)(simState.getVx() * FRICTION));
+        simState.updateVy((int)(simState.getVy() * FRICTION));
 
         if (leadEnemyIdx >= 0) {
-            double edx = s.x - enemies[leadEnemyIdx].x;
-            double edy = s.y - enemies[leadEnemyIdx].y;
+            const auto& pred = otherPredictions[leadEnemyIdx][step + 1];
+            double edx = simState.getX() - pred.x,
+                   edy = simState.getY() - pred.y;
             double enemyDistSq = edx*edx + edy*edy;
-            if (enemyDistSq < s.minEnemyDistSq) s.minEnemyDistSq = enemyDistSq;
+            if (enemyDistSq < simState.minEnemyDistSq) simState.minEnemyDistSq = enemyDistSq;
         }
 
-        bool anyNear = isAnyEnemyNear(s, enemies);
+        bool anyNear = false;
+        for (int podId = 0; podId < otherCount; podId++) {
+            const auto& np = otherPredictions[podId][step + 1];
+            double dx = simState.getX() - np.x, dy = simState.getY() - np.y;
+            if (dx*dx + dy*dy < COLLISION_RADIUS * COLLISION_RADIUS) { anyNear = true; break; }
+        }
         double cpRadius = anyNear ? CP_RADIUS - CP_RADIUS_REDUCTION : CP_RADIUS;
         Point simTarget = checkpoints[simNextCpId];
-        if (segmentIntersectsCircle(startX, startY, s.x, s.y,
-                                     simTarget.x, simTarget.y, cpRadius)) {
-            s.cpsPassed++;
+        if (segmentIntersectsCircle(simState.getPrevX(), simState.getPrevY(), simState.getX(), simState.getY(),
+                                    simTarget.x, simTarget.y, cpRadius)) {
+            simState.cpsPassed++;
             if (arrivalFrame < 0) arrivalFrame = step + 1;
             simNextCpId = (simNextCpId + 1) % checkpointCount;
         }
-        return s;
     }
 
-    SimState rollout(SimState s, int fromStep, int& simNextCpId, int& arrivalFrame,
-                     EnemyStepState enemies[MAX_OTHERS]) {
+    void slowPath(SimState& simState, int simThrust, int step, int& simNextCpId, int& arrivalFrame,
+                  int earliestCollisionPod, double earliestCollisionTime,
+                  PodBaseState othersAfterMove[MAX_OTHERS], PodBase others[MAX_OTHERS]) {
+        slowPathCount++;
+
+        PodBaseState othersFinal[MAX_OTHERS];
+
+        for (int podId = 0; podId < otherCount; ++podId) {
+            othersFinal[podId].x = othersAfterMove[podId].x + othersAfterMove[podId].vx;
+            othersFinal[podId].y = othersAfterMove[podId].y + othersAfterMove[podId].vy;
+            othersFinal[podId].vx = othersAfterMove[podId].vx;
+            othersFinal[podId].vy = othersAfterMove[podId].vy;
+        }
+
+        if (earliestCollisionPod >= 0) {
+            double t = earliestCollisionTime;
+
+            simState.updateX(simState.getX() + t * simState.getVx());
+            simState.updateY(simState.getY() + t * simState.getVy());
+
+            PodBaseState enemyAtCollision;
+            enemyAtCollision.x = othersAfterMove[earliestCollisionPod].x + t * othersAfterMove[earliestCollisionPod].vx;
+            enemyAtCollision.y = othersAfterMove[earliestCollisionPod].y + t * othersAfterMove[earliestCollisionPod].vy;
+            enemyAtCollision.vx = othersFinal[earliestCollisionPod].vx;
+            enemyAtCollision.vy = othersFinal[earliestCollisionPod].vy;
+
+            applyMutualCollision(simState, enemyAtCollision, getMass(simThrust), NORMAL_MASS);
+            if (step == 0 && earliestCollisionPod >= ENEMY_FIRST) {
+                cerr << "HIT p=" << earliestCollisionPod << " m=" << getMass(simThrust)
+                     << " our=(" << (int)simState.getVx() << "," << (int)simState.getVy() << ")"
+                     << " enemy=(" << (int)enemyAtCollision.vx << "," << (int)enemyAtCollision.vy << ")" << endl;
+            }
+            double remaining = 1.0 - t;
+            simState.setAfterCollisionX((int)(simState.getX() + simState.getVx() * remaining));
+            simState.setAfterCollisionY((int)(simState.getY() + simState.getVy() * remaining));
+            othersFinal[earliestCollisionPod].x = enemyAtCollision.x + enemyAtCollision.vx * remaining;
+            othersFinal[earliestCollisionPod].y = enemyAtCollision.y + enemyAtCollision.vy * remaining;
+            othersFinal[earliestCollisionPod].vx = enemyAtCollision.vx;
+            othersFinal[earliestCollisionPod].vy = enemyAtCollision.vy;
+            othersFinal[earliestCollisionPod].modified = true;
+
+            setCollisionFlags(simState, earliestCollisionPod, getMass(simThrust), simThrust);
+        } else {
+            simState.updateX((int)(simState.getX() + simState.getVx()));
+            simState.updateY((int)(simState.getY() + simState.getVy()));
+        }
+
+        for (int podId = 0; podId < otherCount; podId++) {
+            if (podId == earliestCollisionPod) continue;
+            if (applyMutualCollision(simState, othersFinal[podId], getMass(simThrust), NORMAL_MASS)) {
+                othersFinal[podId].modified = true;
+                setCollisionFlags(simState, podId, getMass(simThrust), simThrust);
+            }
+        }
+
+        updateEnemyStates(step, others, othersFinal);
+
+        simState.updateVx((int)(simState.getVx() * FRICTION));
+        simState.updateVy((int)(simState.getVy() * FRICTION));
+
+        if (leadEnemyIdx >= 0) {
+            simState.minEnemyDistSq = min(simState.sqDistTo(others[leadEnemyIdx].getX(), others[leadEnemyIdx].getY()), simState.minEnemyDistSq);
+        }
+
+        Point simTarget = checkpoints[simNextCpId];
+        if (segmentIntersectsCircle(simState.getPrevX(), simState.getPrevY(), simState.getX(), simState.getY(),
+                                     simTarget.x, simTarget.y,
+                                     (isAnyEnemyNear(simState, others) ? CP_RADIUS - CP_RADIUS_REDUCTION : CP_RADIUS))) {
+            simState.cpsPassed++;
+            if (arrivalFrame < 0) arrivalFrame = step + 1;
+            simNextCpId = (simNextCpId + 1) % checkpointCount;
+        }
+    }
+
+    SimState simCandidate(SimState simState, double aimAngle, int simThrust, int step,
+                          int& simNextCpId, int& arrivalFrame,
+                          PodBase others[MAX_OTHERS]) {
+        int actualThrust = resolveThrust(simThrust, simState);
+        applyRotationAndThrust(simState, aimAngle, actualThrust);
+
+        bool anyModified = others[0].modified || others[1].modified ||
+                           (otherCount > 2 && others[2].modified);
+
+        PodBaseState othersAfterMove[MAX_OTHERS];
+        computeEnemyMoves(step, others, othersAfterMove);
+
+        SimpleStateCoords myEndPosition = {simState.getX() + simState.getVx(),
+                                           simState.getY() + simState.getVy()};
+
+        double earliestCollisionTime = 1.1;
+        int earliestCollisionPod = -1;
+        for (int podId = 0; podId < otherCount; ++podId) {
+            SimpleStateCoords enemyEndPosition = {othersAfterMove[podId].x + othersAfterMove[podId].vx,
+                                                  othersAfterMove[podId].y + othersAfterMove[podId].vy};
+            double collisionTime = findCollisionTime(othersAfterMove[podId], enemyEndPosition,
+                                                     simState, myEndPosition, COLLISION_RADIUS);
+            if (collisionTime >= 0 && collisionTime < earliestCollisionTime) {
+                earliestCollisionTime = collisionTime;
+                earliestCollisionPod = podId;
+            }
+        }
+
+        if (earliestCollisionPod < 0 && !anyModified) {
+            fastPath(simState, step, simNextCpId, arrivalFrame);
+            return simState;
+        }
+
+        slowPath(simState, simThrust, step, simNextCpId, arrivalFrame, earliestCollisionPod, earliestCollisionTime, othersAfterMove, others);
+        return simState;
+    }
+
+    void rollout(SimState& simState, int fromStep, int& simNextCpId, int& arrivalFrame,
+                     PodBase others[MAX_OTHERS]) {
         for (int step = fromStep; step < SIM_DEPTH; step++) {
             Point target = checkpoints[simNextCpId];
-            double aimAngle = s.angleTo(target.x, target.y);
-            int rollThrust = angleDependentThrust(aimAngle, s.facingAngle);
-            s = simCandidate(s, aimAngle, rollThrust, step, simNextCpId, arrivalFrame,
-                             enemies);
+            double aimAngle = simState.angleTo(target.x, target.y);
+            int rollThrust = angleDependentThrust(aimAngle, simState.getFacingAngle());
+            simState = simCandidate(simState, aimAngle, rollThrust, step, simNextCpId, arrivalFrame,
+                             others);
         }
-        return s;
     }
 
     double collisionBonus(const SimState& simPod) const {
@@ -636,12 +668,12 @@ struct Pod {
     }
 
     double approachScore(const SimState& simPod, double tx, double ty, double speedWeight = SCORE_SPEED_TOWARD_NORMAL) const {
-        double dx = tx - simPod.x;
-        double dy = ty - simPod.y;
+        double dx = tx - simPod.getX();
+        double dy = ty - simPod.getY();
         double distSq = dx*dx + dy*dy;
         double dist = sqrt(distSq);
         double norm = max(1.0, dist);
-        double speedToward = (simPod.vx * dx + simPod.vy * dy) / norm;
+        double speedToward = (simPod.getVx() * dx + simPod.getVy() * dy) / norm;
         return -dist * distNormCoeff + speedToward * speedWeight;
     }
 
@@ -673,8 +705,8 @@ struct Pod {
 
     double closestEnemyDistSq() const {
         double minDistSq = 1e18;
-        for (int i = 1; i < otherCount; i++) {
-            double dx = x - others[i].x, dy = y - others[i].y;
+        for (int i = ENEMY_FIRST; i < otherCount; i++) {
+            double dx = x - others[i].getX(), dy = y - others[i].getY();
             double d = dx*dx + dy*dy;
             if (d < minDistSq) minDistSq = d;
         }
@@ -683,11 +715,11 @@ struct Pod {
 
     double closestEnemyRelSpeedSq() const {
         double maxRelSq = 0;
-        for (int i = 1; i < otherCount; i++) {
-            double dx = x - others[i].x, dy = y - others[i].y;
+        for (int i = ENEMY_FIRST; i < otherCount; i++) {
+            double dx = x - others[i].getX(), dy = y - others[i].getY();
             double distSq = dx*dx + dy*dy;
             if (distSq < SHIELD_CHECK_DIST * SHIELD_CHECK_DIST) {
-                double rvx = vx - others[i].vx, rvy = vy - others[i].vy;
+                double rvx = vx - others[i].getVx(), rvy = vy - others[i].getVy();
                 double relSq = rvx*rvx + rvy*rvy;
                 if (relSq > maxRelSq) maxRelSq = relSq;
             }
@@ -695,58 +727,58 @@ struct Pod {
         return maxRelSq;
     }
 
-    static bool anyEnemyModified(const EnemyStepState enemies[], int count) {
-        for (int p = 0; p < count; p++) {
-            if (enemies[p].modified) return true;
+    static bool anyEnemyModified(const PodBase others[], int count) {
+        for (int podId = 0; podId < count; ++podId) {
+            if (others[podId].modified) return true;
         }
         return false;
     }
 
-    static void initUnmodifiedEnemies(EnemyStepState enemies[], int count) {
-        for (int p = 0; p < count; p++) enemies[p].modified = false;
+    static void initUnmodifiedEnemies(PodBase others[], int count) {
+        for (int podId = 0; podId < count; ++podId) others[podId].modified = false;
     }
 
     double searchFromStep1(const SimState& afterStep0, int simCpId0, int arrival0,
                            const Point& currentCp, const Point& nextCp,
-                           EnemyStepState enemies0[MAX_OTHERS]) {
+                           PodBase enemies0[MAX_OTHERS]) {
         Point target1 = checkpoints[simCpId0];
         double dirFromStep0 = afterStep0.angleTo(target1.x, target1.y);
         double bestScore = -1e18;
-        bool e0Modified = anyEnemyModified(enemies0, otherCount);
+        bool enemiesModified = anyEnemyModified(enemies0, otherCount);
 
-        for (int ai2 = 0; ai2 < ANGLE_COUNT_23; ai2++) {
-            for (int ti2 = 0; ti2 < THRUST_COUNT_23; ti2++) {
+        for (int angleIdx = 0; angleIdx < ANGLE_COUNT_23; angleIdx++) {
+            for (int thrustIdx = 0; thrustIdx < THRUST_COUNT_23; thrustIdx++) {
                 int simCpId1 = simCpId0;
                 int arrival1 = arrival0;
-                EnemyStepState enemies1[MAX_OTHERS];
-                if (e0Modified) {
-                    for (int p = 0; p < otherCount; p++) enemies1[p] = enemies0[p];
+                PodBase enemies1[MAX_OTHERS];
+                if (enemiesModified) {
+                    for (int podId = 0; podId < otherCount; ++podId) enemies1[podId] = enemies0[podId];
                 } else {
                     initUnmodifiedEnemies(enemies1, otherCount);
                 }
-                SimState afterStep1 = simCandidate(afterStep0, dirFromStep0 + ANGLE_OFFSETS_23[ai2],
-                                                    THRUST_OPTIONS_23[ti2], 1, simCpId1, arrival1,
+                SimState afterStep1 = simCandidate(afterStep0, dirFromStep0 + ANGLE_OFFSETS_23[angleIdx],
+                                                    THRUST_OPTIONS_23[thrustIdx], 1, simCpId1, arrival1,
                                                     enemies1);
 
                 Point target2 = checkpoints[simCpId1];
                 double dirFromStep1 = afterStep1.angleTo(target2.x, target2.y);
-                bool e1Modified = anyEnemyModified(enemies1, otherCount);
+                bool enemiesModifiedStep2 = anyEnemyModified(enemies1, otherCount);
 
-                for (int ai3 = 0; ai3 < ANGLE_COUNT_23; ai3++) {
-                    for (int ti3 = 0; ti3 < THRUST_COUNT_23; ti3++) {
+                for (int angleIdx2 = 0; angleIdx2 < ANGLE_COUNT_23; angleIdx2++) {
+                    for (int thrustIdx2 = 0; thrustIdx2 < THRUST_COUNT_23; thrustIdx2++) {
                         int simCpId = simCpId1;
                         int arrivalFrame = arrival1;
-                        EnemyStepState enemies2[MAX_OTHERS];
-                        if (e1Modified) {
-                            for (int p = 0; p < otherCount; p++) enemies2[p] = enemies1[p];
+                        PodBase enemies2[MAX_OTHERS];
+                        if (enemiesModifiedStep2) {
+                            for (int podId = 0; podId < otherCount; ++podId) enemies2[podId] = enemies1[podId];
                         } else {
                             initUnmodifiedEnemies(enemies2, otherCount);
                         }
-                        SimState simPod = simCandidate(afterStep1, dirFromStep1 + ANGLE_OFFSETS_23[ai3],
-                                                       THRUST_OPTIONS_23[ti3], 2, simCpId, arrivalFrame,
+                        SimState simPod = simCandidate(afterStep1, dirFromStep1 + ANGLE_OFFSETS_23[angleIdx2],
+                                                       THRUST_OPTIONS_23[thrustIdx2], 2, simCpId, arrivalFrame,
                                                        enemies2);
 
-                        simPod = rollout(simPod, 3, simCpId, arrivalFrame, enemies2);
+                        rollout(simPod, 3, simCpId, arrivalFrame, enemies2);
 
                         double score = evaluateScore(simPod, arrivalFrame, currentCp, nextCp);
                         if (score > bestScore) bestScore = score;
@@ -771,11 +803,11 @@ struct Pod {
             return;
         }
 
-        // if (canShield) {
-        //     cerr << "Shield scores: shield=" << bestScoreShield
-        //          << " normal=" << bestScoreNormal
-        //          << " diff=" << bestScoreShield - bestScoreNormal << endl;
-        // }
+        if (canShield) {
+            cerr << "Shield scores: shield=" << bestScoreShield
+                 << " normal=" << bestScoreNormal
+                 << " diff=" << bestScoreShield - bestScoreNormal << endl;
+        }
         if (canShield && bestScoreShield > bestScoreNormal + SHIELD_SCORE_THRESHOLD) {
             thrust = SHIELD_THRUST_VALUE;
             chosenScore = bestScoreShield;
@@ -794,10 +826,53 @@ struct Pod {
         );
     }
 
+    void searchForBestThrust(const SimState& initial, double dirToCp,
+                   const Point& currentCp, const Point& nextCp,
+                   const int step0Thrusts[], int step0ThrustCount,
+                   double& bestScoreNormal, int& bestThrustNormal, double& bestAngleNormal,
+                   double& bestScoreBoost, double& bestAngleBoost,
+                   double& bestScoreShield, double& bestAngleShield) {
+        for (int angleIdx = 0; angleIdx < ANGLE_COUNT_1; angleIdx++) {
+            for (int thrustIdx = 0; thrustIdx < step0ThrustCount; thrustIdx++) {
+                double moveAngle = dirToCp + ANGLE_OFFSETS_1[angleIdx];
+                int simCpId0 = nextCpId;
+                int arrival0 = -1;
+                PodBase enemies0[MAX_OTHERS];
+                initUnmodifiedEnemies(enemies0, otherCount);
+                SimState afterStep0 = simCandidate(initial, moveAngle, step0Thrusts[thrustIdx],
+                                                    0, simCpId0, arrival0, enemies0);
+
+                double score = searchFromStep1(afterStep0, simCpId0, arrival0,
+                                               currentCp, nextCp, enemies0);
+
+                int currentThrust = step0Thrusts[thrustIdx];
+                if (currentThrust == 650) {
+                    if (score > bestScoreBoost) {
+                        bestScoreBoost = score;
+                        bestAngleBoost = moveAngle;
+                    }
+                } else if (currentThrust == SHIELD_THRUST_VALUE) {
+                    if (score > bestScoreShield) {
+                        bestScoreShield = score;
+                        bestAngleShield = moveAngle;
+                    }
+                } else {
+                    if (score > bestScoreNormal) {
+                        bestScoreNormal = score;
+                        bestThrustNormal = currentThrust;
+                        bestAngleNormal = moveAngle;
+                    }
+                }
+            }
+        }
+    }
+
     void findBestMove() {
+        fastPathCount = 0; slowPathCount = 0; enemyCollisionDetected = false;
+        cerr<<"m4";
         precomputeOthers();
 
-        SimState initial = {
+        SimState initial = SimState{
             x, y, vx, vy, facingAngle, 0, shieldCooldown, false, false, false, 1e18
         };
 
@@ -825,18 +900,16 @@ struct Pod {
                              (currentCp.y - y) * (double)(currentCp.y - y);
 
         bool canBoost = boostAvailable && currentLap >= BOOST_MIN_LAP
-                        && currentTurn >= BOOST_MIN_TURN
+                        && boostHoldTurns == 0
                         && distToCpSq > (double)BOOST_MIN_DIST * BOOST_MIN_DIST;
         double maxRelSpeedSq = closestEnemyRelSpeedSq();
-        bool canShield = shieldCooldown == 0
-            && minEnemyDistSqVal < SHIELD_CHECK_DIST * SHIELD_CHECK_DIST
-            && maxRelSpeedSq > SHIELD_MIN_REL_SPEED_SQ;
+        bool canShield = shieldCooldown == 0;
 
-        // if (minEnemyDistSqVal < SHIELD_CHECK_DIST * SHIELD_CHECK_DIST) {
-        //     cerr << "Collision: relV²=" << maxRelSpeedSq
-        //          << " dist=" << sqrt(minEnemyDistSqVal)
-        //          << " shield=" << (canShield ? "available" : "no") << endl;
-        // }
+        if (minEnemyDistSqVal < SHIELD_CHECK_DIST * SHIELD_CHECK_DIST) {
+            cerr << "Collision: relV²=" << maxRelSpeedSq
+                 << " dist=" << sqrt(minEnemyDistSqVal)
+                 << " shield=" << (canShield ? "available" : "no") << endl;
+        }
 
         int step0Thrusts[THRUST_COUNT_1 + 2];
         int step0ThrustCount = THRUST_COUNT_1;
@@ -844,40 +917,14 @@ struct Pod {
         if (canBoost) step0Thrusts[step0ThrustCount++] = 650;
         if (canShield) step0Thrusts[step0ThrustCount++] = SHIELD_THRUST_VALUE;
 
-        for (int ai1 = 0; ai1 < ANGLE_COUNT_1; ai1++) {
-            for (int ti1 = 0; ti1 < step0ThrustCount; ti1++) {
-                double moveAngle1 = dirToCp + ANGLE_OFFSETS_1[ai1];
-                int simCpId0 = nextCpId;
-                int arrival0 = -1;
-                EnemyStepState enemies0[MAX_OTHERS];
-                initUnmodifiedEnemies(enemies0, otherCount);
-                SimState afterStep0 = simCandidate(initial, moveAngle1, step0Thrusts[ti1],
-                                                    0, simCpId0, arrival0, enemies0);
+        cerr<<"m5";
+        searchForBestThrust(initial, dirToCp, currentCp, nextCp,
+                  step0Thrusts, step0ThrustCount,
+                  bestScoreNormal, bestThrustNormal, bestAngleNormal,
+                  bestScoreBoost, bestAngleBoost,
+                  bestScoreShield, bestAngleShield);
 
-                double score = searchFromStep1(afterStep0, simCpId0, arrival0,
-                                               currentCp, nextCp, enemies0);
-
-                int t1 = step0Thrusts[ti1];
-                if (t1 == 650) {
-                    if (score > bestScoreBoost) {
-                        bestScoreBoost = score;
-                        bestAngleBoost = moveAngle1;
-                    }
-                } else if (t1 == SHIELD_THRUST_VALUE) {
-                    if (score > bestScoreShield) {
-                        bestScoreShield = score;
-                        bestAngleShield = moveAngle1;
-                    }
-                } else {
-                    if (score > bestScoreNormal) {
-                        bestScoreNormal = score;
-                        bestThrustNormal = t1;
-                        bestAngleNormal = moveAngle1;
-                    }
-                }
-            }
-        }
-
+        cerr<<"m6 F="<<fastPathCount<<" S="<<slowPathCount;
         selectBestAction(canBoost, canShield, bestScoreNormal, bestThrustNormal, bestAngleNormal,
                          bestScoreBoost, bestAngleBoost, bestScoreShield, bestAngleShield);
     }
@@ -912,6 +959,7 @@ struct Pod {
         if (thrust == 650) {
             cout << "BOOST " << msg << endl;
             boostAvailable = false;
+            boostHoldTurns = BOOST_MIN_TURN / 2;
             cerr << "BOOST activated!" << endl;
         } else if (thrust == SHIELD_THRUST_VALUE) {
             cout << "SHIELD " << msg << endl;
@@ -949,22 +997,22 @@ struct Pod {
         return false;
     }
 
-    static void calcInterceptUrgency(Pod& a, Pod& b, int enemyCps[], int px[], int py[], int pcpid[]) {
+    static void calcInterceptUrgency(Pod& a, Pod& b, int enemyCps[], int podX[], int podY[], int podCpId[]) {
         int ourBestCpsPassed = max(a.totalCpsPassed, b.totalCpsPassed);
         double ourBestDistSq = min(a.distSqToNextCp(), b.distSqToNextCp());
 
         int enemiesAhead = 0;
         for (int e = 0; e < 2; e++) {
-            double edx = checkpoints[pcpid[2+e]].x - px[2+e];
-            double edy = checkpoints[pcpid[2+e]].y - py[2+e];
+            double edx = checkpoints[podCpId[2+e]].x - podX[2+e];
+            double edy = checkpoints[podCpId[2+e]].y - podY[2+e];
             double enemyDistSq = edx*edx + edy*edy;
             if (isEnemyAhead(enemyCps[e], ourBestCpsPassed, enemyDistSq, ourBestDistSq)) enemiesAhead++;
         }
 
         Pod& blocker = a.isBlocker ? a : b;
         Point blockerCp = blocker.getNextCp();
-        int leadOp = findLeadOpponent(px, py, pcpid, enemyCps);
-        Point enemyCp = checkpoints[pcpid[leadOp]];
+        int leadOp = findLeadOpponent(podX, podY, podCpId, enemyCps);
+        Point enemyCp = checkpoints[podCpId[leadOp]];
         bool pathCrossesEnemy = segmentIntersectsCircle(
             blocker.x, blocker.y, blockerCp.x, blockerCp.y,
             enemyCp.x, enemyCp.y, INTERCEPT_PATH_RADIUS);
@@ -975,93 +1023,51 @@ struct Pod {
         b.interceptUrgency = b.isBlocker ? urgency : 0.0;
     }
 
-    static int findLeadOpponent(int px[], int py[], int pcpid[], int enemyCps[]) {
+    static int findLeadOpponent(int podX[], int podY[], int podCpId[], int enemyCps[]) {
         if (enemyCps[1] > enemyCps[0]) return 3;
         if (enemyCps[0] > enemyCps[1]) return 2;
-        double d2 = (checkpoints[pcpid[2]].x - px[2]) * (double)(checkpoints[pcpid[2]].x - px[2])
-                   + (checkpoints[pcpid[2]].y - py[2]) * (double)(checkpoints[pcpid[2]].y - py[2]);
-        double d3 = (checkpoints[pcpid[3]].x - px[3]) * (double)(checkpoints[pcpid[3]].x - px[3])
-                   + (checkpoints[pcpid[3]].y - py[3]) * (double)(checkpoints[pcpid[3]].y - py[3]);
+        double d2 = (checkpoints[podCpId[2]].x - podX[2]) * (double)(checkpoints[podCpId[2]].x - podX[2])
+                   + (checkpoints[podCpId[2]].y - podY[2]) * (double)(checkpoints[podCpId[2]].y - podY[2]);
+        double d3 = (checkpoints[podCpId[3]].x - podX[3]) * (double)(checkpoints[podCpId[3]].x - podX[3])
+                   + (checkpoints[podCpId[3]].y - podY[3]) * (double)(checkpoints[podCpId[3]].y - podY[3]);
         return (d3 < d2) ? 3 : 2;
     }
 
     static int enemyStallCounter[2];
+    static int fastPathCount, slowPathCount;
+    static bool enemyCollisionDetected;
 
-    static int detectGoalie(Pod& a, Pod& b, int px[], int py[], int pvx[], int pvy[]) {
-        Pod& racer = a.isBlocker ? b : a;
-        Point racerCp = racer.getNextCp();
-
-        int goalieEnemy = -1;
-        for (int e = 0; e < 2; e++) {
-            double dx = px[2 + e] - racerCp.x;
-            double dy = py[2 + e] - racerCp.y;
-            double distSq = dx * dx + dy * dy;
-            double speedSq = pvx[2+e]*(double)pvx[2+e] + pvy[2+e]*(double)pvy[2+e];
-            if (distSq < GOALIE_DETECT_DIST * GOALIE_DETECT_DIST && speedSq < GOALIE_MAX_SPEED_SQ) {
-                enemyStallCounter[e]++;
-            } else {
-                enemyStallCounter[e] = 0;
-            }
-            if (enemyStallCounter[e] >= GOALIE_STALL_THRESHOLD) {
-                goalieEnemy = e;
-            }
-        }
-
-        if (goalieEnemy >= 0) {
-            cerr << "GOALIE e" << goalieEnemy << " on CP" << racer.nextCpId
-                 << " stall=" << enemyStallCounter[goalieEnemy] << endl;
-        }
-        return goalieEnemy;
-    }
-
-    static void setupLeadEnemy(Pod pods[], int leadOp, int px[], int py[], int pcpid[]) {
+    static void setupLeadEnemy(Pod pods[], int leadOp, int podX[], int podY[], int podCpId[]) {
         for (int i = 0; i < 2; i++) {
-            pods[i].leadEnemyX = px[leadOp];
-            pods[i].leadEnemyY = py[leadOp];
-            pods[i].leadEnemyNextCpId = pcpid[leadOp];
+            pods[i].leadEnemyX = podX[leadOp];
+            pods[i].leadEnemyY = podY[leadOp];
+            pods[i].leadEnemyNextCpId = podCpId[leadOp];
             pods[i].leadEnemyIdx = (leadOp == 2) ? 1 : 2;
         }
     }
 
-    static void setupOtherPods(Pod pods[], int px[], int py[], int pvx[], int pvy[],
-                                int pangle[], int pcpid[]) {
+    static void setupOtherPods(Pod pods[], int podX[], int podY[], int podVx[], int podVy[],
+                                int podAngle[], int podCpId[]) {
         for (int i = 0; i < 2; i++) {
-            OtherPodState others[3];
+            PodBase others[3];
             int teammate = 1 - i;
-            others[0] = {(double)px[teammate], (double)py[teammate], (double)pvx[teammate], (double)pvy[teammate], pangle[teammate] * DEG_TO_RAD, pcpid[teammate]};
-            others[1] = {(double)px[2], (double)py[2], (double)pvx[2], (double)pvy[2], pangle[2] * DEG_TO_RAD, pcpid[2]};
-            others[2] = {(double)px[3], (double)py[3], (double)pvx[3], (double)pvy[3], pangle[3] * DEG_TO_RAD, pcpid[3]};
+            others[0] = {{(double)podX[teammate], (double)podY[teammate]}, {(double)podVx[teammate], (double)podVy[teammate]}, podAngle[teammate] * DEG_TO_RAD, podCpId[teammate], false};
+            others[1] = {{(double)podX[2], (double)podY[2]}, {(double)podVx[2], (double)podVy[2]}, podAngle[2] * DEG_TO_RAD, podCpId[2], false};
+            others[2] = {{(double)podX[3], (double)podY[3]}, {(double)podVx[3], (double)podVy[3]}, podAngle[3] * DEG_TO_RAD, podCpId[3], false};
             pods[i].setOthers(others, 3);
         }
     }
 
-    static void applyGoalieOverride(Pod pods[], int px[], int py[], int pvx[], int pvy[],
-                                     int enemyCpsPassed[]) {
-        int ourBestCps = max(pods[0].totalCpsPassed, pods[1].totalCpsPassed);
-        int enemyBestCps = max(enemyCpsPassed[0], enemyCpsPassed[1]);
-        if (ourBestCps < enemyBestCps) return;
-
-        Pod& racer = pods[0].isBlocker ? pods[1] : pods[0];
-        Pod& blocker = pods[0].isBlocker ? pods[0] : pods[1];
-        int goalieEnemy = detectGoalie(pods[0], pods[1], px, py, pvx, pvy);
-        if (goalieEnemy < 0) return;
-
-        int idx = 2 + goalieEnemy;
-        blocker.interceptUrgency = 1.0;
-        blocker.leadEnemyX = px[idx];
-        blocker.leadEnemyY = py[idx];
-        blocker.leadEnemyNextCpId = racer.nextCpId;
-        blocker.leadEnemyIdx = (idx == 2) ? 1 : 2;
-    }
-
-    static void setupTurn(Pod pods[], int px[], int py[], int pvx[], int pvy[],
-                          int pangle[], int pcpid[], int enemyCpsPassed[]) {
+    static void setupTurn(Pod pods[], int podX[], int podY[], int podVx[], int podVy[],
+                          int podAngle[], int podCpId[], int enemyCpsPassed[]) {
+        cerr<<"m7";
         assignRoles(pods[0], pods[1]);
-        int leadOp = findLeadOpponent(px, py, pcpid, enemyCpsPassed);
-        calcInterceptUrgency(pods[0], pods[1], enemyCpsPassed, px, py, pcpid);
-        setupLeadEnemy(pods, leadOp, px, py, pcpid);
-        setupOtherPods(pods, px, py, pvx, pvy, pangle, pcpid);
-        // applyGoalieOverride(pods, px, py, pvx, pvy, enemyCpsPassed);
+        int leadOp = findLeadOpponent(podX, podY, podCpId, enemyCpsPassed);
+        cerr<<"m8";
+        calcInterceptUrgency(pods[0], pods[1], enemyCpsPassed, podX, podY, podCpId);
+        setupLeadEnemy(pods, leadOp, podX, podY, podCpId);
+        cerr<<"m9";
+        setupOtherPods(pods, podX, podY, podVx, podVy, podAngle, podCpId);
     }
 
     void receiveTeammateMove(const Pod& teammate) {
@@ -1074,8 +1080,12 @@ struct Pod {
     }
 };
 
-int Pod::currentTurn = 0;
+int PodBase::boostHoldTurns = BOOST_MIN_TURN;
+int PodBase::currentTurn = 0;
 int Pod::enemyStallCounter[2] = {0, 0};
+int Pod::fastPathCount = 0;
+int Pod::slowPathCount = 0;
+bool Pod::enemyCollisionDetected = false;
 
 void computeDistNormCoeff() {
     double totalDist = 0;
@@ -1108,36 +1118,51 @@ int main() {
     int enemyPrevCpId[2] = {-1, -1};
 
     while (true) {
+        cerr<<"st";
         turn++;
-        int px[4], py[4], pvx[4], pvy[4], pangle[4], pcpid[4];
+        int podX[4], podY[4], podVx[4], podVy[4], podAngle[4], podCpId[4];
         for (int i = 0; i < 4; i++) {
-            cin >> px[i] >> py[i] >> pvx[i] >> pvy[i] >> pangle[i] >> pcpid[i]; cin.ignore();
+            cin >> podX[i] >> podY[i] >> podVx[i] >> podVy[i] >> podAngle[i] >> podCpId[i]; cin.ignore();
         }
 
         for (int i = 0; i < 2; i++) {
-            pods[i].setState(px[i], py[i], pvx[i], pvy[i], pangle[i], pcpid[i]);
+            pods[i].setState(podX[i], podY[i], podVx[i], podVy[i], podAngle[i], podCpId[i]);
         }
 
         for (int e = 0; e < 2; e++) {
-            int cpId = pcpid[2 + e];
+            int cpId = podCpId[2 + e];
             if (enemyPrevCpId[e] >= 0 && cpId != enemyPrevCpId[e]) enemyCpsPassed[e]++;
             enemyPrevCpId[e] = cpId;
         }
 
-        Pod::setupTurn(pods, px, py, pvx, pvy, pangle, pcpid, enemyCpsPassed);
+        cerr << "A:us=" << podAngle[0] << "," << podAngle[1] << " en=" << podAngle[2] << "," << podAngle[3];
+        cerr<<"m0";
+        Pod::setupTurn(pods, podX, podY, podVx, podVy, podAngle, podCpId, enemyCpsPassed);
 
         Pod::currentTurn = turn;
+        if (PodBase::boostHoldTurns > 0) PodBase::boostHoldTurns--;
 
-        pods[0].hasTeammateMove = false;
-        pods[0].findBestMove();
+        int racerIdx  = pods[0].isBlocker ? 1 : 0;
+        int blockerIdx = 1 - racerIdx;
 
-        pods[1].receiveTeammateMove(pods[0]);
-        pods[1].findBestMove();
+        pods[racerIdx].hasTeammateMove = false;
+        cerr<<"m1";
+        auto t0 = chrono::steady_clock::now();
+        pods[racerIdx].findBestMove();
+        auto t1 = chrono::steady_clock::now();
+        cerr<<"m2";
+        pods[blockerIdx].receiveTeammateMove(pods[racerIdx]);
+        pods[blockerIdx].findBestMove();
+        auto t2 = chrono::steady_clock::now();
+        cerr << "T" << turn
+             << " R=" << chrono::duration_cast<chrono::microseconds>(t1-t0).count()
+             << " B=" << chrono::duration_cast<chrono::microseconds>(t2-t1).count() << endl;
 
         for (int i = 0; i < 2; i++) {
             if (turn <= 500) pods[i].scoreHistory[turn - 1] = (int)pods[i].chosenScore;
         }
 
+        cerr<<"m3";
         pods[0].navigate();
         pods[1].navigate();
 
@@ -1153,9 +1178,8 @@ int main() {
             if (anyReady) {
                 int count = min(turn, 500);
                 for (int i = 0; i < 2; i++) {
-                    int sum = 0;
-                    for (int t = 0; t < count; t++) sum += pods[i].scoreHistory[t];
-                    cerr << "Pod" << i << " score: " << sum
+                    cerr << "Pod" << i << " score: " 
+                         << std::accumulate(pods[i].scoreHistory.begin(), pods[i].scoreHistory.end(), 0)
                          << " turns: " << count << endl;
                 }
                 showResults = false;
